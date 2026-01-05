@@ -1,0 +1,4033 @@
+from __future__ import annotations
+import json
+import os
+import requests
+import subprocess
+import sys
+import textwrap
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Callable
+from json import JSONDecodeError
+import re
+import inspect
+import random
+from enum import Enum
+import tempfile
+import csv
+import logging
+from uuid import uuid4
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+for h in list(logger.handlers):
+    logger.removeHandler(h)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.DEBUG)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+class Model(BaseModel):
+    name: str
+    timeout: int
+
+GLM_MODEL_NAME = Model(name="zai-org/GLM-4.6-FP8", timeout=150)
+GLM_OLD_MODEL_NAME = Model(name="zai-org/GLM-4.5-FP8", timeout=150)
+QWEN_MODEL_NAME = Model(name="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8", timeout=100)
+KIMI_MODEL_NAME = Model(name="moonshotai/Kimi-K2-Instruct", timeout=60)
+DEEPSEEK_MODEL_NAME = Model(name="deepseek-ai/DeepSeek-V3-0324", timeout=50)
+
+# KIMI_MODEL_NAME = QWEN_MODEL_NAME
+DEEPSEEK_MODEL_NAME = GLM_MODEL_NAME
+GLM_OLD_MODEL_NAME = GLM_MODEL_NAME
+
+AGENT_MODELS = [model for model in [GLM_MODEL_NAME, GLM_OLD_MODEL_NAME, KIMI_MODEL_NAME, QWEN_MODEL_NAME] for _ in range(2)]
+
+run_id=os.getenv("EVALUATION_RUN_ID", str(uuid4()))
+START_TIME = time.time()
+SOLUTION_FILES = []
+MODIEFIED_FILE_PATHS = []
+MODIFIED_FILES = []
+total_inferenced_chars = 0
+individual_inferenced_chars = 0
+
+TIME_MARGIN_FOR_PATCH = 70
+TIME_PADDING_FOR_WORKFLOW = 30
+MAX_INITIAL_SOLUTION_WORKERS = 2
+
+MAX_FIX_TASK_STEPS = 200
+LATEST_OBSERVATIONS_TO_KEEP = 15
+SUMMARIZE_BATCH_SIZE = 10
+MAX_SUMMARY_RANGES = 6
+
+VERSION_COMPATIBILITY_FIX = """
+import sys, pytest, collections, collections.abc, urllib3.exceptions, _pytest.pytester, numpy;
+collections.Mapping = collections.abc.Mapping;
+collections.MutableMapping = collections.abc.MutableMapping;
+collections.MutableSet = collections.abc.MutableSet;
+collections.Sequence = collections.abc.Sequence;
+collections.Callable = collections.abc.Callable;
+collections.Iterable = collections.abc.Iterable;
+collections.Iterator = collections.abc.Iterator;
+urllib3.exceptions.SNIMissingWarning = urllib3.exceptions.DependencyWarning;
+pytest.RemovedInPytest4Warning = DeprecationWarning;
+_pytest.pytester.Testdir = _pytest.pytester.Pytester;
+numpy.PINF = numpy.inf;
+numpy.unicode_ = numpy.str_;
+numpy.bytes_ = numpy.bytes_;
+numpy.float_ = numpy.float64;
+numpy.string_ = numpy.bytes_;
+numpy.NaN = numpy.nan;
+"""
+
+DEFAULT_PROXY_URL = os.getenv("SANDBOX_PROXY_URL", "http://localhost:1234")
+DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "1500"))
+PROBLEM_TYPE_CREATE = "CREATE"
+PROBLEM_TYPE_FIX = "FIX"
+
+FORMAT_PROMPT_FIND_FILES_TO_FIX = textwrap.dedent("""
+**Default: Use single tool call format. Use multiple tool calls ONLY when searching multiple files at once for time efficiency.**
+
+## Response Formats
+
+### Format 1: Single Tool Call (DEFAULT - Use this for most operations)
+next_thought: [Your detailed reasoning]
+next_tool_name: [exact tool name]
+next_tool_args: {valid JSON}
+
+### Format 2: Multiple Tool Calls (ONLY for multi-file searches)
+next_thought: [Your detailed reasoning]
+tool_call_1:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+tool_call_2:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+tool_call_3:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+
+## When to Use Multiple Tool Calls
+
+**ONLY use multiple tool calls when:**
+- Searching multiple files at once (on multiple files/directories simultaneously)
+
+**Examples:**
+
+✅ **Good - Multiple file searches (time efficient)**:
+next_thought: I need to find all references to the function
+tool_call_1:
+    tool_name: get_file_content
+    tool_args: {"file_path": "aaa.py"}
+tool_call_2:
+    tool_name: get_file_content
+    tool_args: {"file_path": "bbb.js"}
+tool_call_3:
+    tool_name: get_file_content
+    tool_args: {"file_path": "ccc.js"}
+
+✅ **Good - Single tool call (default)**:
+next_thought: I'll read this file to understand the code
+next_tool_name: get_file_content
+next_tool_args: {"file_path": "aaa.py"}
+
+## Critical Rules
+- Default to single tool call format (next_tool_name, next_tool_args)
+- Use multiple tool calls ONLY for parallel multi-file searches
+- All JSON must be properly formatted with quotes
+- Tool names must match exactly (case-sensitive)
+""")
+
+INSTANCE_PROMPT_TEMPLATE = textwrap.dedent("""
+Now let's start.
+```
+{problem_statement}
+```
+""")
+
+FORMAT_PROMPT_FIX = textwrap.dedent(
+    """
+**CRITICAL: You can make MULTIPLE tool calls in ONE response for efficiency!**
+## Response Formats
+### Format 1: Multiple Tool Calls (RECOMMENDED for efficiency)
+next_thought: [Your detailed reasoning]
+tool_call_1:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+tool_call_2:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+tool_call_3:
+    tool_name: [exact tool name]
+    tool_args: {valid JSON}
+### Format 2: Single Tool Call (Legacy, less efficient)
+next_thought: [Your detailed reasoning]
+next_tool_name: [exact tool name]
+next_tool_args: {valid JSON}
+## When to Use Multiple Tool Calls
+**ALWAYS batch these operations:**
+1. **Edit + Test**: After code edit, MUST test in same response
+2. **Multiple Searches**: Batch all search operations together
+3. **Multiple File Reads**: Read all needed files at once
+4. **Multiple Tests**: Run all test files together
+## Examples
+✅ **Excellent - Edit and Test Together**:
+next_thought: I'll fix the bug and immediately verify with tests
+tool_call_1:
+    tool_name: apply_code_edit
+    tool_args: {"file_path": "abcd.py", "search": "old_code", "replace": "fixed_code"}
+tool_call_2:
+    tool_name: run_code
+    tool_args: {"content": "test_content", "file_path": "file.js", "run_command": ["node", "file.js"]}
+✅ **Good - Batch Multiple Searches**:
+next_thought: I need to find all references to the function
+tool_call_1:
+    tool_name: search_in_files
+    tool_args: {"grep_search_command": "grep -r 'function problematic_func' ."}
+tool_call_2:
+    tool_name: search_in_files
+    tool_args: {"grep_search_command": "grep -r 'problematic_func(' ."}
+tool_call_3:
+    tool_name: get_file_content
+    tool_args: {"file_path": "abcd.js"}
+❌ **Bad - One tool per response (too slow)**:
+Response 1:
+next_thought: Let me edit the file
+next_tool_name: apply_code_edit
+next_tool_args: {"file_path": "aaa.py", ...}
+Response 2 (next turn):
+next_thought: Now let me test it
+next_tool_name: run_code
+...  # ← Should have been in previous response!
+## Critical Rules
+- Use multiple tool_call_N when possible (tool_call_1, tool_call_2, tool_call_3, ...)
+- After any edit: MUST include test in same response
+- All JSON must be properly formatted with quotes
+- Tool names must match exactly (case-sensitive)
+"""
+)
+
+FORMAT_PROMPT = textwrap.dedent("""
+## Response Format
+
+Use the following format for all tool calls:
+
+next_thought: [Your detailed reasoning]
+next_tool_name: [exact tool name]
+next_tool_args: {valid JSON}
+
+**Examples:**
+
+✅ **Read a file**:
+next_thought: I'll read this file to understand the code
+next_tool_name: get_file_content
+next_tool_args: {"file_path": "aaa.py"}
+
+✅ **Edit a file**:
+next_thought: I'll edit the file
+next_tool_name: apply_code_edit
+next_tool_args: {"file_path": "aaa.py", "search": "old_code", "replace": "new_code"}
+
+✅ **Run a command**:
+next_thought: I'll run a command to verify the changes
+next_tool_name: run_shell_cmd
+next_tool_args: {"command": "your_command_here"}
+
+## Critical Rules
+- Always use single tool call format (next_tool_name, next_tool_args)
+- All JSON must be properly formatted with quotes
+- Tool names must match exactly (case-sensitive)
+""")
+
+STOP_INSTRUCTION=textwrap.dedent("""
+# 🎯 RESPONSE REQUIREMENTS
+- DO NOT generate `observation:` - it will be provided by the system
+- Default format: next_thought: ... followed by next_tool_name and next_tool_args (single tool call)
+- Use multiple tool calls (tool_call_1, tool_call_2, etc.) ONLY when searching multiple files at once for time efficiency
+- Format: next_thought: ... followed by next_tool_name/next_tool_args OR tool_call_N blocks
+""")
+
+CREATE_TASK_SYSTEM_PROMPT = textwrap.dedent(
+    """
+# Hey there! You're a Coding Assistant 🚀. You will be provided with a problem statement and need to create/fix code to implement the requirements.
+
+**CRITICAL CONTEXT:**
+This workflow involves an initial solution and test cases that were generated automatically. Both the source code files AND the test files may contain errors or incorrect implementations. The problem statement is the authoritative source of truth.
+
+## Follow these steps to solve the problem:
+1. **Understand the problem deeply** - Carefully read the problem statement. **CRITICAL**: The problem statement includes a "Misunderstanding Points Analysis" section and edge case guidance - read these sections EXTREMELY carefully as they highlight critical pitfalls and requirements that are easy to miss.
+2. **Review the initial solution** - Examine the automatically generated source code and test files. Both may contain errors.
+3. **Prioritize misunderstanding points and edge cases** - The problem statement contains analysis of misunderstanding points and common edge cases. **You MUST address each one explicitly**:
+   - Review the "Misunderstanding Points Analysis" section - these are requirements that are commonly misinterpreted
+   - Review the edge case guidance - these are cases that frequently cause failures
+   - Before coding, ensure your solution handles ALL identified misunderstanding points and edge cases
+4. **Fix source code** - Edit the source code to correctly implement the requirements, ensuring it addresses all misunderstanding points and handles all identified edge cases.
+5. **Fix test files if needed** - If test cases conflict with the problem statement, fix them using `modify_test_case` tool. If source code doesn't match requirements, fix the source code.
+6. **Test thoroughly** - Run tests after each change. Explicitly verify that all misunderstanding points are correctly handled and all edge cases pass.
+7. **Iterate until perfect** - Continue refining until all tests pass, all misunderstanding points are addressed, and all edge cases are handled. **Failing to address misunderstanding points and edge cases is the NUMBER ONE failure mode.**
+8. **Final validation** - Ensure the solution: (1) correctly addresses all misunderstanding points, (2) handles all edge cases, (3) matches the problem statement exactly, and (4) all tests pass. Be aware there are hidden tests that must also pass.
+
+## Edge Cases and Misunderstanding Points (CRITICAL):
+- **The problem statement contains "Misunderstanding Points Analysis" and edge case guidance - READ AND ADDRESS THEM ALL**
+- **Always handle edge cases first** before implementing the main logic:
+- **Watch for common misunderstandings** (especially those highlighted in the analysis):
+- **Test edge cases explicitly** - Don't assume they're covered. Verify each misunderstanding point and edge case is correctly handled.
+
+## Critical Requirements:
+- Code must always be backward compatible unless explicitly mentioned otherwise in the problem statement.
+- Thoroughly check the entire codebase to ensure changes are exhaustive and don't break other functionality.
+- If a test case fails several times consecutively, review it against the problem statement. If it's incorrect, fix the test file directly using `modify_test_case`.
+- Do not create new files unless absolutely necessary.
+- Always check both expected output mentioned in the problem statement AND the output in the most relevant test case.
+- If you find errors while running the run_code tool due to missing dependencies, do not try to solve it as you don't have any internet access.
+
+## Step Efficiency:
+You have a limited step budget (target: 5 steps, maximum: 15 steps). Prioritize simpler, faster solutions and make forward progress with each step. Test frequently to catch issues early. Don't over-investigate - once you understand the issue, implement the fix.
+
+You have access to the following tools:-
+{tools_docs}
+
+Here is the problem statement:
+{problem_statement}
+
+# Response Format Requirements
+{format_prompt}
+"""
+)
+
+MAKE_REAL_PROGRESS=textwrap.dedent("""
+You are making same mistakes.
+Your previous response: 
+{previous_response}
+
+**Critical**:
+1. Notice what you are going to do.
+2. Find the reason the same mistake is repeated.
+3. Don't make the same mistakes any more and make a real progress.
+""")
+
+FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
+# Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and you need to make the necessary changes to fix the issue.
+
+## Follow these steps to fix the issue:
+1. As a first step, find the relevant files in the repo to work on.
+2. Localise the code causing the issue.
+3. Edit the sourcecode of the repo to resolve the issue.
+4. Think about edgecases and make sure the fix handles them as well.
+5. Code must always be backward compatible unless explicitly mentioned otherwise in the problem statement.
+6. Thoroughly check the entire code base to ensure the changes made are exhaustive and does not break any other functionality.
+7. Thoroughly check the entire code base to ensure the changes user requested are only limited to the ones you have identified.
+8. Never edit/update the existing test files directly when validating a hypothesis. Instead, when you need a new or focused test to reproduce or protect the fix, use the dedicated test generation tool.
+9. Do not create any new files or directories unless absolutely necessary for the fix. Generated tests are allowed but are excluded from the final patch automatically.
+10. Always check all the test cases which will be impacted with your change and ensure they don't fail.
+11. You need to propose at least 2 meaningfully different and accurate solutions to the problem to the user for approval.
+12. You need to look at both expected output mentioned in the problem statement AND the output in the most relevant test case. This is very important.
+13. If you find that the error while running the run_code or run_tests tool due to missing dependencies, do not try to solve it as you don't have any internet access.
+
+## Multi-file awareness (critical):
+- Tests and patch contexts may span multiple files. Do not stop after the first similar match or applied fix.
+- Keep searching the repository after each match and apply consistent changes to every relevant file before finishing.
+- Prefer using `search_in_files` to enumerate matches across the codebase and drill into each file; iterate until no applicable occurrences remain.
+- Re-run tests only after covering all discovered occurrences to avoid partial fixes.
+
+You have access to the following tools:-
+{tools_docs}
+
+Here is the problem statement:
+{problem_statement}
+
+{format_prompt}
+""")
+
+from tree_sitter import Parser
+from tree_sitter_language_pack import get_language
+_codeparse_util_language_cache = {}
+
+class Utils:
+    @classmethod
+    def limit_strings(cls,strings: str, n=1000)->str:
+        '''
+        Limit the number of strings to 1000
+        '''
+        strings_list=strings.split("\n")
+        if len(strings_list)>n:
+            return "\n".join(strings_list[:n])+"\n..." + f"({len(strings_list)-n} more lines)"
+        else:
+            return strings
+
+    @classmethod
+    def load_json(cls,json_string:str)->dict:
+        try:
+            return json.loads(json_string)
+        except Exception as e:
+            try:
+                return eval(json_string)
+            except Exception as e:
+                logger.info(f"unable to fix manually, trying with llm")
+                fixed_json=EnhancedNetwork.fix_json_string_with_llm(json_string)
+                if fixed_json:
+                    return fixed_json
+                else:
+                    raise JSONDecodeError("Invalid JSON", json_string, 0)
+                
+    @classmethod
+    def count_tokens(cls, messages: list | str) -> int:
+        import re
+        if isinstance(messages, list):
+            text = " ".join(str(m.get("content", "") if isinstance(m, dict) else m) for m in messages)
+        else:
+            text = messages
+        tokens = re.findall(r'\w+|[^\w\s]|\s+', text)
+        count = 0
+        for token in tokens:
+            if token.isspace():
+                continue
+            elif len(token) == 1:
+                count += 1
+            else:
+                count += max(1, (len(token) + 2) // 3)
+        return count
+
+class EnhancedNetwork:
+    @classmethod
+    def _extract_tool_call_from_block(cls, block: str) -> dict | None:
+        tool_name_match = re.search(r"tool_name\s*:\s*([^\s]+)", block, re.IGNORECASE)
+        if not tool_name_match:
+            return None
+        tool_name = tool_name_match.group(1).strip("\"'")
+        args_match = re.search(r"tool_args\s*:\s*\{", block, re.IGNORECASE)
+        if not args_match:
+            return None
+        args_start = args_match.end() - 1
+        json_str = cls._extract_balanced_braces(block, args_start)
+        if json_str:
+            try:
+                tool_args = json.loads(json_str)
+                return {"tool_name": tool_name, "tool_args": tool_args}
+            except json.JSONDecodeError:
+                try:
+                    tool_args = json.loads(json_str.replace("'", '"'))
+                    return {"tool_name": tool_name, "tool_args": tool_args}
+                except Exception:
+                    pass
+        return None
+
+    @classmethod
+    def _extract_balanced_braces(cls, text: str, start_pos: int) -> str | None:
+        if start_pos >= len(text):
+            return None
+        brace_count, in_string, escape_next, start = 0, False, False, -1
+        for i in range(start_pos, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\":
+                escape_next = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if c == "{":
+                    if start == -1:
+                        start = i
+                    brace_count += 1
+                elif c == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and start != -1:
+                        return text[start : i + 1]
+        return None
+
+    @classmethod
+    def get_cost_usage(cls) -> dict:
+        global run_id
+        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/usage?evaluation_run_id={run_id if run_id else str(uuid4())}"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            usage_info = response.json()
+            if isinstance(usage_info, dict):
+                return usage_info
+            return {"used_cost_usd": 0, "max_cost_usd": float("inf")}
+        except Exception:
+            return {"used_cost_usd": 0, "max_cost_usd": float("inf")}
+
+    @classmethod
+    def is_http_response(cls, raw_text: str):
+        if "API request failed with status 429" in raw_text:
+            return False, cls.ErrorType.RATE_LIMIT_EXCEEDED.name
+        if "Read timed out" in raw_text:
+            return False, cls.ErrorType.TIMEOUT.name
+        if "HTTP ERROR: Request failed for model" in raw_text:
+            return False, cls.ErrorType.NETWORK_ERROR.name
+        return True, None
+
+    @classmethod
+    def _request_next_action_with_retry(
+        cls,
+        messages: dict,
+        models: list[str],
+        max_retries: int = 3,
+        temperature: float = 0.0,
+    ) -> str:
+        raw_text = None
+        error_counter = cls.get_error_counter()
+        next_thought = next_tool_name = next_tool_args = None
+        total_attempts = 0
+        current_model_idx = 0
+        used_model = models[0] if models else None
+        for attempt in range(max_retries):
+            try:
+                total_attempts += 1
+                current_model = models[min(current_model_idx, len(models) - 1)]
+                used_model = current_model
+                raw_text, _ = cls.make_request(messages, model=current_model, temperature=temperature)
+                is_valid, error_msg = cls.is_valid_response(raw_text)
+                if not is_valid:
+                    raise Exception(error_msg)
+                next_thought, next_tool_name, next_tool_args, error_msg = cls.parse_response(raw_text)
+                if error_msg:
+                    raise Exception(error_msg)
+                break
+            except Exception as e:
+                error_body = str(e)
+                is_504_error = "504" in error_body or "HTTP ERROR 504" in error_body or "Gateway Timeout" in error_body
+                if "Agent execution timeout" in error_body:
+                    raise RuntimeError(error_body)
+                if is_504_error and current_model_idx < len(models) - 1:
+                    current_model_idx += 1
+                    time.sleep(3)
+                    continue
+                if attempt < max_retries - 1:
+                    matched = False
+                    for key in ["RATE_LIMIT_EXCEEDED", "RESERVED_TOKEN_PRESENT", "EMPTY_RESPONSE", "TIMEOUT", "Invalid JSON", "Invalid response"]:
+                        if key in error_body:
+                            attr_name = key if key in cls.ErrorType.__members__ else "INVALID_RESPONSE_FORMAT"
+                            error_counter[attr_name] += 1
+                            matched = True
+                            break
+                    if not matched:
+                        error_counter[cls.ErrorType.UNKNOWN.name] += 1
+                    skip_http = any(
+                        x in error_body
+                        for x in [
+                            "HTTP ERROR",
+                            "RATE_LIMIT_EXCEEDED",
+                            "RESERVED_TOKEN_PRESENT",
+                            "EMPTY_RESPONSE",
+                            "TIMEOUT",
+                            "NETWORK_ERROR",
+                            "HTTP ERROR 429",
+                            "INCOMPLETE_RESPONSE",
+                        ]
+                    )
+                    if not skip_http:
+                        messages.append({"role": "assistant", "content": raw_text})
+                        messages.append({"role": "user", "content": "observation: " + error_body})
+                    time.sleep(3)
+                    continue
+                else:
+                    error_counter[cls.ErrorType.TIMEOUT.name] += 1
+                    raise RuntimeError(error_body)
+        return (
+            next_thought,
+            next_tool_name,
+            next_tool_args,
+            raw_text,
+            total_attempts,
+            error_counter,
+            messages,
+            used_model,
+        )
+
+
+    @classmethod
+    def inference(
+        cls,
+        messages: list[dict],
+        model: str,
+        run_id: str = str(uuid4()),
+        temperature: float = 0.0,
+    ) -> dict:
+        models = [model] if isinstance(model, str) else model
+        cleaned_msgs = [
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in messages
+            if m.get("role") in {"system", "user", "assistant", "tool"} and (m.get("role") != "assistant" or m.get("content", "").strip())
+        ]
+        if not cleaned_msgs:
+            raise RuntimeError("No valid messages to send to proxy.")
+
+        result = cls._request_next_action_with_retry(cleaned_msgs, models=models, temperature=temperature)
+        return result
+
+
+    @classmethod
+    def make_request(
+        cls,
+        messages: list,
+        model: Model,
+        attempt: int = 0,
+        temperature: float = 0.0,
+        tool_mode: str = "none",
+        tool_docs: list = [],
+    ) -> tuple[str, list]:
+        global total_inferenced_chars, individual_inferenced_chars
+        messages_str = json.dumps(messages, ensure_ascii=False)
+        individual_inferenced_chars = len(messages_str)
+        total_inferenced_chars += individual_inferenced_chars
+        url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
+        attempts = max(1, attempt or 1)
+        request_data = {
+            "evaluation_run_id":  run_id if run_id else str(uuid4()),
+            "messages": messages,
+            "temperature": temperature,
+            "model": model.name,
+            "tool_mode": tool_mode,
+            "tools": tool_docs,
+        }
+        headers = {"Content-Type": "application/json"}
+        for i in range(attempts):
+            try:
+                start_time = time.time()
+                print(f"⏳ Sending request using {model} and {model.timeout} seconds timeout")
+                resp = requests.post(url, json=request_data, timeout=(30, model.timeout), headers=headers)
+                resp.raise_for_status()
+                print(f"✔ Request success using {model} and {time.time() - start_time:.2f} seconds elapsed!")
+                try:
+                    resp_json = resp.json()
+                    print(format_log("MAKE_REQUEST", f"resp_json: {resp_json}"))
+                except JSONDecodeError as e:
+                    if i >= attempts - 1:
+                        raise ValueError(f"HTTP ERROR: Invalid JSON response for model {model} after {attempts} attempts: {e}")
+                    continue
+                try:
+                    raw_text = resp_json["content"]
+                    tool_calls = resp_json["tool_calls"]
+                except Exception:
+                    raise RuntimeError(f"HTTP ERROR: Response Parse Error timeout for model {model} after {attempts} attempts")
+                if (tool_mode == "none" and not raw_text) or (tool_mode != "none" and not tool_calls):
+                    raise RuntimeError(f"HTTP ERROR: NO RESPONSE FOUND Tool model {model} after {attempts} attempts")
+                return raw_text, tool_calls
+            except requests.exceptions.Timeout:
+                if i >= attempts - 1:
+                    raise RuntimeError(f"HTTP ERROR: Request timeout for model {model} after {attempts} attempts")
+                time.sleep(1)
+            except requests.exceptions.ConnectionError as e:
+                if i >= attempts - 1:
+                    raise RuntimeError(f"HTTP ERROR: Connection error for model {model} after {attempts} attempts: {e}")
+                time.sleep(1)
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else "unknown"
+                if status_code == 504:
+                    if i >= attempts - 1:
+                        raise RuntimeError(f"HTTP ERROR 504: Gateway Timeout for model {model} after {attempts} attempts: {e}")
+                    time.sleep(1)
+                    continue
+                error_msg = f"HTTP ERROR: HTTP ERROR {status_code} for model {model}"
+                if i >= attempts - 1:
+                    raise RuntimeError(f"{error_msg} after {attempts} attempts: {e}")
+                time.sleep(1)
+            except requests.exceptions.RequestException as e:
+                if i >= attempts - 1:
+                    raise RuntimeError(f"HTTP ERROR: Request failed for model {model} after {attempts} attempts: {e}")
+                time.sleep(1)
+        raise RuntimeError(f"HTTP ERROR: Failed to get response for model {model} after {attempts} attempts")
+
+    @classmethod
+    def parse_malformed_json(cls, arguments: list[str], json_string: str) -> dict | str:
+        pattern = r",\s*".join(rf'"{k}": (.*)' for k in arguments)
+        match = re.search(pattern, json_string)
+        if not match:
+            return f"Error: {json_string} can not match pattern {pattern}"
+        return {k: match.group(i + 1).strip().strip('"').replace("\\n", "\n") for i, k in enumerate(arguments)}
+
+    @classmethod
+    def parse_next_tool_args(cls, tool_name: str, next_tool_args: str) -> dict | str:
+        next_tool_args = next_tool_args.replace("```json", "").strip("```")
+        try:
+            return Utils.load_json(next_tool_args.strip())
+        except JSONDecodeError:
+            try:
+                return cls.parse_malformed_json(
+                    EnhancedToolManager.get_tool_args_for_tool(tool_name, required_only=True),
+                    next_tool_args,
+                )
+            except (EnhancedToolManager.Error, Exception):
+                raise Exception(f"Invalid JSON: {next_tool_args}")
+
+    @classmethod
+    def sanitise_text_resp(cls, text_resp: str) -> str:
+        text_resp = re.sub(r"['\"]*next_thought['\"]*:", "next_thought:", text_resp)
+        text_resp = re.sub(r"['\"]*next_tool_name['\"]*:", "next_tool_name:", text_resp)
+        text_resp = re.sub(r"['\"]*next_tool_args['\"]*:", "next_tool_args:", text_resp)
+        text_resp = re.sub(r"['\"]*observation['\"]*:", "observation:", text_resp)
+        text_resp = re.sub(r"['\"]*tool_call_['\"]*", "tool_call_", text_resp)
+        if (
+            "next_thought" not in text_resp
+            and "next_tool_name:" in text_resp
+            and "next_tool_args:" in text_resp
+            and text_resp.find("next_tool_name:") < text_resp.find("next_tool_args:")
+            and text_resp.find("next_tool_name:") > 10
+        ):
+            text_resp = "next_thought: " + text_resp
+        if (
+            "next_tool_name:" in text_resp
+            and "next_tool_args:" in text_resp
+            and text_resp.find("next_tool_name:") < text_resp.find("next_tool_args:")
+        ):
+            next_tool_name = text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n").strip("'").strip('"').strip()
+            text_resp = re.sub(
+                f"next_tool_name:['\" ]*{re.escape(next_tool_name)}['\" ]*",
+                "next_tool_name: " + next_tool_name,
+                text_resp,
+            )
+        return text_resp
+
+    @classmethod
+    def is_valid_response(cls, raw_text: str) -> bool:
+        if isinstance(raw_text, dict) and raw_text.get("error"):
+            return False, cls.ErrorType.EMPTY_RESPONSE.name
+        stripped = raw_text.strip()
+        lower = raw_text.lower()
+        has_next_thought = "next_thought" in lower or "<next_thought>" in lower
+        has_next_tool_name = "next_tool_name" in lower or "<next_tool_name>" in lower
+        has_next_tool_args = "next_tool_args" in lower or "<next_tool_args>" in lower
+        valid_ending = stripped.endswith("}") or stripped.endswith("}]") or stripped.endswith("</next_tool_args>") or stripped.endswith(">")
+        if has_next_thought and has_next_tool_name and has_next_tool_args and not valid_ending:
+            return False, cls.ErrorType.INCOMPLETE_RESPONSE.name
+        if not raw_text:
+            return False, cls.ErrorType.EMPTY_RESPONSE.name
+        if "<|reserved_token_" in raw_text:
+            return False, cls.ErrorType.RESERVED_TOKEN_PRESENT.name
+        return cls.is_http_response(raw_text)
+
+    @classmethod
+    def get_error_counter(cls) -> dict[str, int]:
+        return {k: 0 for k in cls.ErrorType.__members__}
+
+    @classmethod
+    def parse_response(cls, text_resp: str) -> tuple[str | None, any, any, str | None]:
+        error_msg = None
+        text_resp = text_resp.strip()
+        if "observation:" in text_resp.lower():
+            text_resp = re.split(r"observation\s*:", text_resp, flags=re.IGNORECASE)[0].strip()
+        text_resp = cls.sanitise_text_resp(text_resp)
+        if "Infrastructure is at maximum capacity" in text_resp:
+            return None, None, None, "HTTP ERROR Maximum Capacity"
+        if "No instances available" in text_resp:
+            return None, None, None, "HTTP ERROR NO INSTANCES AVAILABLE"
+        next_thought = None
+        for pat in [
+            r"next_thought\s*:\s*(.*?)(?=\n(?:tool_call_|next_tool_name:|$))",
+            r"next_thought\s*:\s*(.*?)(?=\ntool_call_)",
+            r"next_thought\s*:\s*(.*?)(?=\nnext_tool_name:)",
+            r"next_thought\s*:\s*(.*)",
+        ]:
+            match = re.search(pat, text_resp, re.DOTALL | re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate and len(candidate) > 2:
+                    next_thought = candidate
+                    break
+        if not next_thought:
+            next_thought = "Processing request"
+        tool_call_matches = list(re.finditer(r"tool_call_(\d+)\s*:", text_resp, re.IGNORECASE))
+        if tool_call_matches:
+            tool_calls = []
+            for i, match in enumerate(tool_call_matches):
+                start = match.end()
+                end = tool_call_matches[i + 1].start() if i + 1 < len(tool_call_matches) else len(text_resp)
+                block = text_resp[start:end].strip()
+                call = cls._extract_tool_call_from_block(block)
+                if call:
+                    tool_calls.append(call)
+            if not tool_calls:
+                return next_thought, None, None, "Multi-tool format detected but no valid tool calls extracted"
+            tool_names = [c["tool_name"] for c in tool_calls]
+            tool_args_list = [c["tool_args"] for c in tool_calls]
+            if len(tool_names) == 1:
+                return next_thought, tool_names[0], tool_args_list[0], error_msg
+            return next_thought, tool_names, tool_args_list, error_msg
+        if "next_tool_name:" in text_resp and "next_tool_args:" in text_resp:
+            name_idx = text_resp.find("next_tool_name:")
+            args_idx = text_resp.find("next_tool_args:")
+            if text_resp.find("next_thought:") < name_idx < args_idx:
+                next_tool_name_raw = text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip()
+                next_tool_args_raw = text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip()
+                try:
+                    if next_tool_name_raw.startswith("["):
+                        next_tool_names = Utils.load_json(next_tool_name_raw)
+                    else:
+                        next_tool_names = [next_tool_name_raw]
+                    parsed_args = cls.parse_next_tool_args(next_tool_names, next_tool_args_raw)
+                    next_tool_args_list = parsed_args if isinstance(parsed_args, list) else [parsed_args for _ in next_tool_names]
+                    if len(next_tool_names) == 1:
+                        return next_thought, next_tool_names[0], next_tool_args_list[0], error_msg
+                    return next_thought, next_tool_names, next_tool_args_list, error_msg
+                except (JSONDecodeError, Exception) as e:
+                    error_msg = f"Invalid JSON in tool args: {str(e)}"
+                    return next_thought, None, None, error_msg
+        if "next_thought:" not in text_resp:
+            error_msg = "Invalid response. next_thought not found"
+        elif "next_tool_name:" not in text_resp and "tool_call_" not in text_resp:
+            error_msg = "Invalid response. No tool calls found (expected next_tool_name: or tool_call_N:)"
+        elif "next_tool_args:" not in text_resp and "tool_call_" not in text_resp:
+            error_msg = "Invalid response. next_tool_args not found"
+        else:
+            error_msg = "Invalid response format. Could not parse tool calls."
+        return next_thought, None, None, error_msg
+
+    @classmethod
+    def fix_json_string_with_llm(cls, json_string: str, attempt: int = 0) -> dict:
+        messages = [
+            {
+                "role": "system",
+                "content": "Fix the json string sent by the user.  Reply only with the json string and nothing else.",
+            },
+            {"role": "user", "content": json_string},
+        ]
+        selected_model = QWEN_MODEL_NAME
+        retry = 0
+        while retry < 5:
+            try:
+                response, _ = cls.make_request(messages, model=selected_model)
+                break
+            except Exception:
+                retry += 1
+                remaining = [model for model in AGENT_MODELS if model != selected_model]
+                if remaining:
+                    selected_model = random.choice(remaining)
+                time.sleep(1)
+        try:
+            response = response.replace("```json", "").strip("```")
+            return json.loads(response)
+        except Exception:
+            return None
+
+    class ErrorType(Enum):
+        EMPTY_RESPONSE = 1
+        RESERVED_TOKEN_PRESENT = 2
+        RATE_LIMIT_EXCEEDED = 3
+        INVALID_RESPONSE_FORMAT = 4
+        TIMEOUT = 5
+        UNKNOWN = 6
+        NETWORK_ERROR = 7
+        AUTHENTICATION_ERROR = 8
+        RESOURCE_EXHAUSTED = 9
+        INCOMPLETE_RESPONSE = 10
+
+class CodeParseUtil:
+    def __init__(self):
+        self._parsers = {}
+        
+    def _classify_node_type(self, node) -> tuple[str, int | None]:
+        node_type_str = node.type.lower()
+        if "function" in node_type_str or "method" in node_type_str:
+            for i, child in enumerate(node.children):
+                if self._is_identifier_node(child):
+                    return ("function", i)
+            return ("function", None)
+        elif "class" in node_type_str:
+            for i, child in enumerate(node.children):
+                if self._is_identifier_node(child):
+                    return ("class", i)
+            return ("class", None)
+        return ("other", None)
+
+    def _get_parser(self, language: str):
+        if Parser is None or get_language is None:
+            return None
+        if language not in self._parsers:
+            try:
+                lang_obj = get_language(language)
+                if lang_obj is None:
+                    return None 
+                parser = Parser(lang_obj)
+                self._parsers[language] = parser
+            except Exception as e:
+                logger.warning(f"Error creating parser for {language}: {e}")
+                return None
+        return self._parsers[language]
+    def _is_identifier_node(self, node) -> bool:
+        return "identifier" in node.type.lower()
+
+    def check_language(self, source: str, file_path: str | None = None) -> str | None:
+        global _codeparse_util_language_cache
+        if file_path and not os.path.exists(file_path) or not source or not source.strip():
+            return None
+        if file_path:
+            file_path = os.path.abspath(file_path) if file_path else None
+            if file_path and file_path in _codeparse_util_language_cache:
+                return _codeparse_util_language_cache[file_path] 
+        stripped_source = source.strip()
+        sample = stripped_source if len(stripped_source) <= 1000 else f"{stripped_source[:500]}\n\n... [middle content omitted] ...\n\n{stripped_source[-500:]}"
+        prompt = f"""Detect the programming language of the following code sample.
+        Analyze the code and determine which programming language it is written in.
+        Return ONLY the language name in lowercase.
+        If you cannot determine the language, return "unknown".
+        Code sample:
+        ```
+        {sample}
+        ```
+        Return ONLY the language name in lowercase, no other text or explanation."""
+        retry = 0 
+        messages = [{"role": "user", "content": prompt}] 
+        models_to_try = [KIMI_MODEL_NAME, GLM_MODEL_NAME]
+        while retry < 3:
+            try:
+                result, _ = EnhancedNetwork.make_request(messages=messages, model=models_to_try[retry % len(models_to_try)], attempt=1, temperature=0.0)
+                cleaned = result.strip().lower()
+                cleaned = cleaned.removeprefix("```").removesuffix("```").strip() 
+                cleaned = cleaned.strip('"').strip("'").strip() 
+
+                if cleaned and ' ' not in cleaned and cleaned.isalpha():
+                    detected_language = cleaned if cleaned != 'unknown' else None
+                else:
+                    retry += 1
+                    if retry < 3:
+                        messages.append({"role": "assistant", "content": result})
+                        messages.append({"role": "user", "content": "Please return ONLY the language name as a single word in lowercase. No other text."})
+                        time.sleep(1)
+                    continue
+                if file_path:
+                    _codeparse_util_language_cache[file_path] = detected_language
+                return detected_language
+            except Exception as e:
+                logger.warning(f"Error detecting language with LLM (attempt {retry + 1}/3): {e}")
+                retry += 1
+                if retry < 3:
+                    time.sleep(1)
+                continue
+        return None
+
+    def _find_specific_function(self, node, source_lines: list[str], target_qualified: str, target_simple: str, class_name: str = "", parent_node = None) -> dict | None:
+        if not node.children:
+            return None
+        node_type, name_child_index = self._classify_node_type(node)
+        if node_type == "class":
+            name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point
+                if name_start[0] < len(source_lines):
+                    line = source_lines[name_start[0]]
+                    name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+            if not name and parent_node:
+                for child in parent_node.children:
+                    if self._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+                            if name: break
+            if name:
+                new_class_name = f"{class_name}.{name}" if class_name else name
+                for child in node.children:
+                    result = self._find_specific_function(child, source_lines, target_qualified, target_simple, new_class_name, node)
+                    if result is not None:
+                        return result
+
+        elif node_type == "function":
+            name = internal_name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point
+                if name_start[0] < len(source_lines):
+                    line = source_lines[name_start[0]]
+                    internal_name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+            if parent_node:
+                for child in parent_node.children:
+                    if self._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+                            if name: break
+            if not name:
+                name = internal_name
+            if name:
+                qualified_name = f"{class_name}.{name}" if class_name else name
+                is_qualified_target = '.' in target_qualified
+                is_match = qualified_name == target_qualified or (not is_qualified_target and name == target_simple)
+                if is_match:
+                    at_start = node.start_point[0]
+                    for i in range(at_start - 1, -1, -1):
+                        if source_lines[i].strip().startswith('@'):
+                            at_start = i
+                        elif source_lines[i].strip():
+                            break
+                    return {'start_line': at_start + 1, 'end_line': node.end_point[0] + 1}
+            for child in node.children:
+                result = self._find_specific_function(child, source_lines, target_qualified, target_simple, class_name, node)
+                if result is not None:
+                    return result
+        for child in node.children:
+            result = self._find_specific_function(child, source_lines, target_qualified, target_simple, class_name, node)
+            if result is not None:
+                return result
+        return None
+
+    def get_function_body(self, file_path: str, function_name: str, add_line_numbers: bool = False) -> str:
+        if not function_name or not os.path.exists(file_path):
+            return ""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+        except Exception as e:
+            logger.warning(f"Error reading file {file_path}: {e}")
+            return ""
+        if not source or Parser is None:
+            return ""
+        try:
+            source_bytes, source_lines = bytes(source, 'utf8'), source.splitlines()
+            language = self.check_language(source, file_path=file_path)
+            if not language:
+                return ""
+            parser = self._get_parser(language)
+            if parser is None:
+                return ""
+            tree = parser.parse(source_bytes)
+            target_qualified, target_simple = function_name, function_name.split('.')[-1]
+            func_info = self._find_specific_function(tree.root_node, source_lines, target_qualified, target_simple)
+            if func_info is None:
+                return ""
+            start_idx, end_idx = func_info['start_line'] - 1, func_info['end_line'] - 1 
+            if 0 <= start_idx < len(source_lines) and 0 <= end_idx < len(source_lines): 
+                body_lines = source_lines[start_idx:end_idx + 1]
+                return '\n'.join(f"{start_idx + i + 1}| {line}" for i, line in enumerate(body_lines)) if add_line_numbers else '\n'.join(body_lines)
+        except Exception as e:
+            logger.warning(f"Error finding function {function_name} in {file_path}: {e}")
+        return ""
+
+    def _get_definition_line(self, node, source_lines: list[str], include_at_lines: bool = False) -> tuple[str, bool]:
+        at_start = node.start_point[0]
+        starts_with_at = False
+        if include_at_lines:
+            for i in range(at_start - 1, -1, -1):
+                if source_lines[i].strip().startswith('@'): 
+                    at_start, starts_with_at = i, True 
+                elif source_lines[i].strip():
+                    break
+        if at_start < len(source_lines):
+            line = source_lines[at_start].strip()
+            if line.startswith('@') and not include_at_lines:
+                starts_with_at = True
+                for i in range(at_start + 1, len(source_lines)):
+                    next_line = source_lines[i].strip()
+                    if next_line and not next_line.startswith('@'):
+                        return (next_line, False)
+            if line.startswith('@'):
+                starts_with_at = True 
+            return (line, starts_with_at) 
+        return ("", False)
+        
+    def _extract_skeleton_structure(self, node, source_lines: list[str], classes: list, functions: list, class_name: str = "", current_class_methods: list = None, parent_node = None, processed_nodes = None, processed_classes = None):
+        if processed_nodes is None:
+            processed_nodes = set()
+        if processed_classes is None:
+            processed_classes = set()
+        node_key = (node.start_point[0], node.start_point[1], node.end_point[0], node.end_point[1])
+        if node_key in processed_nodes:
+            return
+        processed_nodes.add(node_key)
+        if not node.children: return
+        node_type, name_child_index = self._classify_node_type(node)
+        if node_type == "class":
+            name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point
+                if name_start[0] < len(source_lines): 
+                    line = source_lines[name_start[0]] 
+                    name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+            if not name and parent_node:
+                for child in parent_node.children:
+                    if self._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+                            if name: break
+            if name:
+                class_line = node.start_point[0] + 1
+                class_key = (name, class_line)
+                if class_key not in processed_classes:
+                    processed_classes.add(class_key)
+                    def_line, starts_with_at = self._get_definition_line(node, source_lines)
+                    if starts_with_at:
+                        return
+                    methods = []
+                    new_class_name = f"{class_name}.{name}" if class_name else name
+                    for child in node.children:
+                        self._extract_skeleton_structure(child, source_lines, classes, functions, new_class_name, methods, node, processed_nodes, processed_classes)
+                    classes.append({'name': name, 'line': class_line, 'definition': def_line, 'methods': methods})
+                return
+        elif node_type == "function":
+            name = None
+            internal_name = None
+            if name_child_index is not None and name_child_index < len(node.children):
+                name_child = node.children[name_child_index]
+                name_start, name_end = name_child.start_point, name_child.end_point 
+                if name_start[0] < len(source_lines):
+                    line = source_lines[name_start[0]]
+                    internal_name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+            if parent_node:
+                for child in parent_node.children:
+                    if self._is_identifier_node(child) and child != node:
+                        name_start, name_end = child.start_point, child.end_point
+                        if name_start[0] < len(source_lines):
+                            line = source_lines[name_start[0]]
+                            name = line[name_start[1]:name_end[1]].strip() if name_start[0] == name_end[0] else line[name_start[1]:].strip()
+                            if name: break
+            if not name:
+                name = internal_name
+            if name:
+                def_line, starts_with_at = self._get_definition_line(node, source_lines)
+                if starts_with_at:
+                    return
+                func_info = {'name': name, 'line': node.start_point[0] + 1, 'definition': def_line}
+                if current_class_methods is not None:
+                    current_class_methods.append(func_info)
+                else: 
+                    functions.append(func_info) 
+                return
+        for child in node.children:
+            self._extract_skeleton_structure(child, source_lines, classes, functions, class_name, current_class_methods, node, processed_nodes, processed_classes)
+
+class COT:
+    class Action:          
+        def __init__(self, next_thought: str, next_tool_name: str, next_tool_args: dict, observation: list|tuple|str,is_error:bool=False,raw_response:str=None,total_attempts:int=0,inference_error_counter:dict=None,request_data:list=None):
+            self.next_thought=next_thought
+            self.next_tool_name=next_tool_name
+            self.next_tool_args=next_tool_args
+            self.observation=";".join(observation) if isinstance(observation,list) else observation
+            self.is_error=is_error
+            self.raw_response=raw_response
+            self.total_attempts=total_attempts
+            self.inference_error_counter=inference_error_counter
+            self.request_data=request_data
+            self.is_deleted=False
+
+    def __init__(self,latest_observations_to_keep=5, summarize_batch_size=10):
+        self.thoughts: list[COT.Action] = []
+        self.latest_observations_to_keep=latest_observations_to_keep
+        self.summarize_batch_size = summarize_batch_size
+
+    def add_action(self, action: COT.Action) -> bool:
+        self.thoughts.append(action)
+        return True
+        
+    def count_repeated_thoughts(self)->int:
+        """
+        Count the number of consecutive repeated thoughts at the end of the COT.
+        Returns 0 if no repetition, or the count of consecutive repeated thoughts.
+        """
+        if len(self.thoughts) < 2:
+            return 0
+        last_thought = self.thoughts[-1]
+        last_tool_name = last_thought.next_tool_name
+        last_tool_args = last_thought.next_tool_args
+        count = 0
+        for i in range(len(self.thoughts) - 1, -1, -1):
+            thought = self.thoughts[i]
+            if thought.next_tool_name == last_tool_name and thought.next_tool_args == last_tool_args:
+                count += 1
+            else:
+                break
+        return max(0, count - 1)
+
+    def to_str(self):
+        messages = []
+        total_thoughts = len(self.thoughts)
+        start_idx = 0
+        recent_thoughts = self.thoughts[start_idx:]
+        valid_thoughts = [(i + start_idx, thought) for i, thought in enumerate(recent_thoughts) if not thought.is_deleted]
+        seen_tool_calls = set()
+        unique_thoughts = []
+        for idx, thought in reversed(valid_thoughts):
+            tool_name_normalized = thought.next_tool_name
+            if isinstance(tool_name_normalized, list):
+                tool_name_normalized = tuple(tool_name_normalized)
+            try:
+                if thought.next_tool_args is None:
+                    tool_args_str = ""
+                elif isinstance(thought.next_tool_args, list):
+                    tool_args_str = json.dumps(thought.next_tool_args, sort_keys=True)
+                else:
+                    tool_args_str = json.dumps(thought.next_tool_args, sort_keys=True)
+            except Exception:
+                tool_args_str = str(thought.next_tool_args) if thought.next_tool_args else ""
+            tool_call_key = (tool_name_normalized, tool_args_str)
+            if tool_call_key not in seen_tool_calls:
+                seen_tool_calls.add(tool_call_key)
+                unique_thoughts.append((idx, thought))
+        unique_thoughts.reverse()
+        idxs = [idx for idx, _ in unique_thoughts]
+        for i, (idx, thought) in enumerate(unique_thoughts):
+            if thought.is_error is None or i==len(unique_thoughts)-1:
+                assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
+                if isinstance(thought.observation, (list, tuple)):
+                    try:
+                        obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
+                    except Exception:
+                        obs_render=str(thought.observation)
+                else:
+                    obs_render=str(thought.observation) if thought.observation else ""
+                user_str=f"observation: {obs_render}"
+            else:
+                last_idx, last_thought = unique_thoughts[-1]
+                if last_thought.is_error==None and thought.is_error!=None:
+                    assistant_str = (
+                        f"next_thought:{thought.next_thought}\n"
+                        f"next_tool_name:{thought.next_tool_name}\n"
+                        f"next_tool_args:{thought.next_tool_args}")
+                    if thought.observation is None:
+                        _obs_len = 0
+                    elif isinstance(thought.observation, (list, tuple)):
+                        _obs_len = len(thought.observation)
+                    else:
+                        _obs_len = len(str(thought.observation).splitlines())
+                    user_str=(
+                        f"observation: error ocurred. detailed output omitted "
+                        f"({_obs_len}) lines\n"
+                    )
+                else:
+                    assistant_str=f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
+                    if isinstance(thought.observation, (list, tuple)):
+                        try:
+                            obs_render=json.dumps(list(thought.observation), ensure_ascii=False)
+                        except Exception:
+                            obs_render=str(thought.observation)
+                    else:
+                        obs_render=str(thought.observation) if thought.observation else ""
+                    user_str=f"observation: {obs_render}"
+            messages.append({"role": "assistant", "content": assistant_str})
+            messages.append({"role": "user", "content": user_str})
+        
+        return messages
+
+class EnhancedCOT:
+    def __init__(self, latest_observations_to_keep=5, summarize_batch_size=10):
+        self.thoughts = []
+        self.latest_observations_to_keep = latest_observations_to_keep
+        self.repeated_thoughts = 0
+        self.summarize_batch_size = summarize_batch_size
+        self.summaries = {}
+        self.summarized_ranges = []
+
+    def _get_summary_for_index(self, idx):
+        for (start, end), summary in self.summaries.items():
+            if start <= idx < end:
+                return summary
+        return None
+
+    def _check_and_summarize_if_needed(self):
+        total_thoughts = len(self.thoughts)
+        cutoff_idx = total_thoughts - self.latest_observations_to_keep
+        if cutoff_idx < self.summarize_batch_size:
+            return
+        unsummarized = 0
+        for s, e in sorted(self.summarized_ranges):
+            if s <= unsummarized < e:
+                unsummarized = e
+            elif s > unsummarized:
+                break
+        if unsummarized >= cutoff_idx:
+            return
+        summarize_start = unsummarized
+        summarize_end = min(summarize_start + self.summarize_batch_size, cutoff_idx)
+        batch_size = summarize_end - summarize_start
+        if batch_size >= self.summarize_batch_size:
+            range_key = (summarize_start, summarize_end)
+            if range_key not in self.summaries:
+                summary = self._summarize_messages_batch(summarize_start, summarize_end)
+                if summary:
+                    self.summaries[range_key] = summary
+                    self.summarized_ranges.append(range_key)
+                    self.summarized_ranges.sort()
+
+    def _summarize_messages_batch(self, start_idx, end_idx):
+        if start_idx >= end_idx or end_idx > len(self.thoughts):
+            return None
+        conversation_parts = []
+        for i in range(start_idx, end_idx):
+            thought = self.thoughts[i]
+            if getattr(thought, "is_deleted", False):
+                continue
+            assistant_part = (
+                f"next_thought: {thought.next_thought}\n" f"next_tool_name: {thought.next_tool_name}\n" f"next_tool_args: {thought.next_tool_args}\n"
+            )
+            obs = thought.observation
+            if isinstance(obs, (list, tuple)):
+                try:
+                    obs_render = json.dumps(list(obs), ensure_ascii=False)
+                except Exception:
+                    obs_render = str(obs)
+            else:
+                obs_render = str(obs) if obs else ""
+            if len(obs_render) > 40000:
+                obs_render = obs_render[:40000] + "... [truncated for summarization]"
+            user_part = f"observation: {obs_render}"
+            conversation_parts.append(
+                {
+                    "assistant": assistant_part,
+                    "user": user_part,
+                    "is_error": getattr(thought, "is_error", False),
+                }
+            )
+        if not conversation_parts:
+            return None
+        conv_lines = []
+        for idx, part in enumerate(conversation_parts, 1):
+            conv_lines.append(f"\n--- Step {idx} ---")
+            conv_lines.append(f"Assistant: {part['assistant']}")
+            user_obs = part["user"]
+            if len(user_obs) > 40000:
+                user_obs = user_obs[:40000] + "... [truncated]"
+            conv_lines.append(f"User: {user_obs}")
+            if part.get("is_error"):
+                conv_lines.append("[Error occurred]")
+        conversation_text = "\n".join(conv_lines)
+        summarization_prompt = textwrap.dedent(
+            f"""
+            You are summarizing a conversation history between an AI agent and its environment.
+            Summarize the following conversation steps concisely, focusing on:
+            1. Key actions taken (tools used, files modified, tests run)
+            2. Important findings or errors encountered
+            3. Progress made toward solving the problem
+            4. Critical decisions or changes in approach
+            Keep the summary concise (2-4 sentences per step) but preserve important details.
+            Conversation to summarize:
+            {conversation_text}
+            Provide a concise summary:
+        """
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that summarizes conversation history concisely.",
+            },
+            {"role": "user", "content": summarization_prompt},
+        ]
+        for _ in range(3):
+            try:
+                response, _ = EnhancedNetwork.make_request(messages, model=QWEN_MODEL_NAME, temperature=0.0)
+                return response.strip()
+            except Exception:
+                time.sleep(1)
+        return None
+
+    def count_repeated_thoughts(self)->int:
+        """
+        Count the number of consecutive repeated thoughts at the end of the COT.
+        Returns 0 if no repetition, or the count of consecutive repeated thoughts.
+        """
+        if len(self.thoughts) < 2:
+            return 0
+        last_thought = self.thoughts[-1]
+        last_tool_name = last_thought.next_tool_name
+        last_tool_args = last_thought.next_tool_args
+        count = 0
+        for i in range(len(self.thoughts) - 1, -1, -1):
+            thought = self.thoughts[i]
+            if thought.next_tool_name == last_tool_name and thought.next_tool_args == last_tool_args:
+                count += 1
+            else:
+                break
+        return max(0, count - 1)
+
+    def is_thought_repeated(self):
+        if len(self.thoughts) < 2:
+            self.repeated_thoughts = 0
+            return False
+        last = self.thoughts[-1]
+        prev = self.thoughts[-2]
+        if last.next_tool_name == prev.next_tool_name and last.next_tool_args == prev.next_tool_args:
+            self.repeated_thoughts += 1
+            return True
+        self.repeated_thoughts = 0
+        return False
+
+    def add_action(self, action):
+        self.thoughts.append(action)
+        if len(self.thoughts) >= self.latest_observations_to_keep + self.summarize_batch_size:
+            self._check_and_summarize_if_needed()
+        return True
+
+    def to_str(self):
+        messages = []
+        last_summary_range = None
+
+        allowed_ranges = set(self.summarized_ranges[-MAX_SUMMARY_RANGES:]) if self.summarized_ranges else set()
+        total = len(self.thoughts)
+        keep_last = self.latest_observations_to_keep
+
+        for i, thought in enumerate(self.thoughts):
+            if getattr(thought, "is_deleted", False):
+                continue
+
+            recent = i >= total - keep_last
+
+            if not recent:
+                summary = self._get_summary_for_index(i)
+                if summary:
+                    found_range = False
+                    for (start, end), _ in self.summaries.items():
+                        if start <= i < end:
+                            cur_range = (start, end)
+                            if cur_range not in allowed_ranges:
+                                found_range = True
+                                break
+                            if cur_range != last_summary_range:
+                                messages.append(
+                                    {"role": "system", "content": f"[Summarized conversation history (steps {start+1} to {end}):\n{summary}\n]"}
+                                )
+                                last_summary_range = cur_range
+                            found_range = True
+                            break
+                    if found_range:
+                        continue
+                assistant_str = (
+                    f"next_thought:{thought.next_thought}\n" f"next_tool_name:{thought.next_tool_name}\n" f"next_tool_args:{thought.next_tool_args}"
+                )
+
+                obs = thought.observation
+                if isinstance(obs, (list, tuple)):
+                    try:
+                        obs_render = json.dumps(list(obs), ensure_ascii=False)
+                    except Exception:
+                        obs_render = str(obs)
+                else:
+                    obs_render = str(obs) if obs else ""
+                user_str = f"observation: {obs_render}"
+
+                messages.append({"role": "assistant", "content": assistant_str})
+                messages.append({"role": "user", "content": user_str})
+            else:
+                if thought.is_error is None or i == total - 1:
+                    assistant_str = (
+                        f"next_thought:{thought.next_thought}\n"
+                        f"next_tool_name:{thought.next_tool_name}\n"
+                        f"next_tool_args:{thought.next_tool_args}"
+                    )
+
+                    obs = thought.observation
+                    if isinstance(obs, (list, tuple)):
+                        try:
+                            obs_render = json.dumps(list(obs), ensure_ascii=False)
+                        except Exception:
+                            obs_render = str(obs)
+                    else:
+                        obs_render = str(obs)
+                    user_str = f"observation: {obs_render}"
+                else:
+                    if self.thoughts[-1].is_error is None and thought.is_error is not None:
+                        assistant_str = (
+                            f"next_thought:{thought.next_thought}\n"
+                            f"next_tool_name:{thought.next_tool_name}\n"
+                            f"next_tool_args:{thought.next_tool_args}"
+                        )
+                        obs = thought.observation
+                        if obs is None:
+                            obs_len = 0
+                        elif isinstance(obs, (list, tuple)):
+                            obs_len = len(obs)
+                        else:
+                            obs_len = len(str(obs).splitlines())
+                        user_str = f"observation: error ocurred. detailed output omitted ({obs_len}) lines\n"
+                    else:
+                        assistant_str = (
+                            f"next_thought:{thought.next_thought}\n"
+                            f"next_tool_name:{thought.next_tool_name}\n"
+                            f"next_tool_args:{thought.next_tool_args}"
+                        )
+                        obs = thought.observation
+                        if isinstance(obs, (list, tuple)):
+                            try:
+                                obs_render = json.dumps(list(obs), ensure_ascii=False)
+                            except Exception:
+                                obs_render = str(obs)
+                        else:
+                            obs_render = str(obs)
+                        user_str = f"observation: {obs_render}"
+                messages.append({"role": "assistant", "content": assistant_str})
+                messages.append({"role": "user", "content": user_str})
+
+        return messages
+
+    class Action:
+        def __init__(
+            self,
+            next_thought: str,
+            next_tool_name: str,
+            next_tool_args: dict,
+            observation,
+            is_error: bool = False,
+            raw_response: str = None,
+            total_attempts: int = 0,
+            inference_error_counter: dict = None,
+            request_data: list = None,
+        ):
+            self.next_thought = next_thought
+            self.next_tool_name = next_tool_name
+            self.next_tool_args = next_tool_args
+            self.observation = ";".join(observation) if isinstance(observation, list) else observation
+            self.is_error = is_error
+            self.raw_response = raw_response
+            self.total_attempts = total_attempts
+            self.inference_error_counter = inference_error_counter
+            self.request_data = request_data
+            self.is_deleted = False
+
+class FileOperationsUtil:
+    def __init__(self, new_files_created: list):
+        self.new_files_created = new_files_created
+        self.file_system_manager = None
+        self.search_manager = None
+
+    def get_file_content(
+        self,
+        file_path: str,
+        search_term: str = None,
+        add_line_numbers: bool = False,
+    ) -> str:
+        search_callback = lambda fp, st: self.search_manager.search_in_file(fp, st)
+        return self.file_system_manager.get_file_content(
+            file_path=file_path,
+            search_term=search_term,
+            add_line_numbers=add_line_numbers,
+            search_in_file_callback=search_callback,
+        )
+
+    def save(self, file_path: str, content: str) -> str:
+        with open(file_path, "w") as file:
+            file.write(content)
+        self.new_files_created.append(file_path)
+        return f"File {file_path} saved successfully"
+
+    def set_managers(self, file_system_manager, search_manager):
+        self.file_system_manager = file_system_manager
+        self.search_manager = search_manager
+
+class CodeEditManager:
+    def __init__(self, file_ops: "FileOperationsUtil" = None):
+        self.file_ops = file_ops
+
+    def apply_code_edit(self, file_path: str, search: str, replace: str) -> str:
+        def add_context_to_similar_match(original_content: str, formatted_match: str, context_lines: int = 2) -> str:
+            """Add context lines around a similar match for better understanding."""
+            lines = original_content.split("\n")
+            match_lines = formatted_match.split("\n")
+            if len(match_lines) < 2:
+                return formatted_match
+            actual_content_lines = match_lines[1:]
+            actual_content = "\n".join(actual_content_lines)
+            best_match_start = -1
+            best_similarity = 0
+            for i in range(len(lines) - len(actual_content_lines) + 1):
+                candidate_lines = lines[i : i + len(actual_content_lines)]
+                candidate_content = "\n".join(candidate_lines)
+                import difflib
+                similarity = difflib.SequenceMatcher(None, actual_content.strip(), candidate_content.strip()).ratio()
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match_start = i
+            if best_match_start == -1:
+                return formatted_match
+            start_line = max(0, best_match_start - context_lines)
+            end_line = min(len(lines), best_match_start + len(actual_content_lines) + context_lines)
+            context_lines_list = []
+            for i in range(start_line, end_line):
+                line_num = i + 1
+                prefix = ">>> " if best_match_start <= i < best_match_start + len(actual_content_lines) else "    "
+                context_lines_list.append(f"{prefix}{line_num:4}| {lines[i]}")
+            description = match_lines[0] if match_lines else f"Match found at lines {best_match_start+1}-{best_match_start+len(actual_content_lines)}"
+            return f"{description}\n" + "\n".join(context_lines_list)
+
+        def find_most_similar_content(original_content: str, search_string: str, max_results: int = 3) -> list[tuple[float, str]]:
+            import difflib
+            lines = original_content.split("\n")
+            chunks = []
+            for i, line in enumerate(lines):
+                if line.strip():
+                    chunks.append((f"Line {i+1}: {line.strip()}", line.strip()))
+            search_lines = search_string.split("\n")
+            target_chunk_size = max(3, len(search_lines))
+            for i in range(len(lines) - target_chunk_size + 1):
+                chunk_lines = lines[i : i + target_chunk_size]
+                chunk_content = "\n".join(chunk_lines).strip()
+                if chunk_content:
+                    chunks.append((f"Lines {i+1}-{i+target_chunk_size}: ...", chunk_content))
+            similarities = []
+            for chunk_desc, chunk_content in chunks:
+                ratio = difflib.SequenceMatcher(None, search_string.strip(), chunk_content).ratio()
+                if ratio > 0.3:
+                    similarities.append((ratio, chunk_desc, chunk_content))
+            similarities.sort(key=lambda x: x[0], reverse=True)
+            return [(ratio, f"{desc}\n{content}") for ratio, desc, content in similarities[:max_results]]
+
+        if search == replace:
+            return "ERROR: search and replace are the same. Please provide a different search and replace."
+        if not os.path.exists(file_path):
+            return f"Error: file '{file_path}' does not exist."
+        original = self.file_ops.get_file_content(file_path)
+        match original.count(search):
+            case 0:
+                similar_matches = find_most_similar_content(original, search, 1)
+                error_msg = f"Error: search string not found in file {file_path}."
+                if similar_matches:
+                    error_msg += f"\n\nMost similar snippet found (you may need to adjust your search string):"
+                    for i, (ratio, content) in enumerate(similar_matches, 1):
+                        similarity_pct = int(ratio * 100)
+                        content_with_context = add_context_to_similar_match(original, content, context_lines=2)
+                        error_msg += f"\n\n{i}. Similarity: {similarity_pct}%\n{content_with_context}"
+                else:
+                    error_msg += " No similar content found. Please check the file content and provide the exact code you want to replace."
+                return error_msg
+            case 1:
+                new_content = original.replace(search, replace)
+                try:
+                    self.file_ops.save(file_path, new_content)
+                    replace_pos = new_content.find(replace)
+                    if replace_pos != -1:
+                        lines = new_content.split("\n")
+                        chars_so_far = 0
+                        replace_line_start = 0
+                        for i, line in enumerate(lines):
+                            if chars_so_far + len(line) >= replace_pos:
+                                replace_line_start = i
+                                break
+                            chars_so_far += len(line) + 1
+                        replace_lines_count = replace.count("\n") + 1
+                        replace_line_end = replace_line_start + replace_lines_count - 1
+                        start_line = max(0, replace_line_start - 10)
+                        end_line = min(len(lines), replace_line_start + 10)
+                        context_lines = []
+                        for i in range(start_line, end_line):
+                            line_num = i + 1
+                            if replace_line_start <= i <= replace_line_end:
+                                prefix = ">>> "
+                            else:
+                                prefix = "    "
+                            context_lines.append(f"{prefix}{line_num:4}| {lines[i]}")
+                        context = "\n".join(context_lines)
+                        return f"ok, code edit applied successfully. Here is the edited code (lines {start_line+1}-{end_line}):\n\n{context}"
+                    else:
+                        return "ok, code edit applied successfully"
+                except Exception as e:
+                    return f"Error: syntax error in file {file_path}. {str(e)}"
+            case num_hits:
+                return f"Error: search string found {num_hits} times in file '{file_path}'.\nPlease reformulate your search and replace to apply only one change."
+
+class TestManager:
+    def __init__(self, runner_hint: str | None = None, runner_mode_hint: str | None = None, file_ops: "FileOperationsUtil" = None):
+        self.runner_hint = runner_hint
+        self.runner_mode_hint = runner_mode_hint
+        self.file_ops = file_ops
+
+    def run_code(self, content: str, file_path: str, generated_test_files: list, run_command: list[str]) -> str:
+        if file_path.endswith((".py", ".pyw", ".pyx", ".pyi", ".pxd", ".pxi", ".pyz")):
+            content = VERSION_COMPATIBILITY_FIX + "\n\n" + content
+        file_exists = os.path.exists(file_path) and os.path.isfile(file_path)
+        self.file_ops.save(file_path, content)
+        if file_path not in generated_test_files and not file_exists:
+            generated_test_files.append(file_path)
+        try:
+            result = subprocess.run(run_command, capture_output=True, text=True, check=False, timeout=60)
+            if result.returncode != 0:
+                return f"Error running code: {result.stderr}"
+            return f"{result.stdout}\n"
+        except Exception as e:
+            return f"Error: {e}"
+
+class FileSystemManager:
+    def __init__(self):
+        pass
+
+    def get_file_content(
+        self,
+        file_path: str,
+        search_term: str = None,
+        add_line_numbers: bool = False,
+        search_in_file_callback=None,
+    ) -> str:
+
+        def add_line_numbers_to_content(content: str, start_line: int = 1) -> str:
+            lines = content.splitlines()
+            numbered_lines = []
+            for i, line in enumerate(lines):
+                line_num = start_line + i
+                numbered_lines.append(f"{line_num:6}|{line}")
+            return "\n".join(numbered_lines)
+
+        if search_term and search_in_file_callback:
+            return search_in_file_callback(file_path, search_term)
+
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+            if add_line_numbers:
+                result = add_line_numbers_to_content(content, 1)
+            else:
+                result = content
+        return result
+
+    def list_directory_structure(self, directory_path: str, max_depth: int = 0) -> str:
+        if not os.path.exists(directory_path):
+            return f"Error: Directory '{directory_path}' does not exist."
+        if not os.path.isdir(directory_path):
+            return f"Error: '{directory_path}' is not a directory."
+        ignore = {".git", "__pycache__", ".pytest_cache", "node_modules", ".tox", ".venv", "venv", ".eggs"}
+
+        def tree(path: str, prefix: str = "", depth: int = 0, current_max_depth: int = 0) -> list[str]:
+            if depth > current_max_depth:
+                return []
+            try:
+                items = sorted(os.listdir(path))
+            except (PermissionError, OSError) as e:
+                return [f"{prefix}[Error reading directory: {str(e)}]"]
+            dirs = [
+                i for i in items if os.path.isdir(os.path.join(path, i)) and not i.startswith(".") and i not in ignore and not i.endswith(".egg-info")
+            ]
+            files = [i for i in items if os.path.isfile(os.path.join(path, i)) and not i.startswith(".")]
+            lines: list[str] = []
+            for idx, d in enumerate(dirs):
+                is_last = (idx == len(dirs) - 1) and not files
+                branch = "└── " if is_last else "├── "
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                lines.append(f"{prefix}{branch}{d}/")
+                lines.extend(tree(os.path.join(path, d), new_prefix, depth + 1, current_max_depth))
+            for idx, f in enumerate(files):
+                is_last = idx == len(files) - 1
+                branch = "└── " if is_last else "├── "
+                lines.append(f"{prefix}{branch}{f}")
+            return lines
+
+        def count_tokens(text: str) -> int:
+            try:
+                if "Utils" in globals() and hasattr(Utils, "count_tokens"):
+                    return Utils.count_tokens(text)
+            except (NameError, AttributeError):
+                pass
+            return len(text) // 4
+
+        MAX_TOKENS = 10000
+        current_depth = max_depth
+        while current_depth >= 0:
+            entries = tree(directory_path, "", 0, current_depth)
+            result = f"Directory structure (depth={current_depth}):\n{directory_path}/\n" + "\n".join(entries)
+            token_count = count_tokens(result)
+            if token_count <= MAX_TOKENS:
+                if current_depth < max_depth:
+                    result += (
+                        f"\n\n[Note: Requested depth {max_depth} exceeded token limit. Showing depth {current_depth} instead ({token_count} tokens).]"
+                    )
+                return result
+            if current_depth == 0:
+                result += f"\n\n[Warning: Result exceeds token limit ({token_count} tokens > {MAX_TOKENS} tokens). Consider using a more specific directory_path.]"
+                return result
+            current_depth -= 1
+        entries = tree(directory_path, "", 0, 0)
+        result = f"Directory structure (depth=0):\n{directory_path}/\n" + "\n".join(entries)
+        return result
+
+class SearchManager:
+    def search_in_all_files(self, grep_search_command: str) -> str:
+        cmd = grep_search_command.lstrip()
+        if not cmd.startswith("grep"):
+            return f"Error: Invalid command. Expected a grep command but got: '{grep_search_command}'"
+        try:
+            result = subprocess.run(["bash", "-c", grep_search_command], capture_output=True, text=True, timeout=45)
+        except Exception as e:
+            return f"Error: Failed to execute grep command: {e}"
+        if result.returncode > 1:
+            error_msg = result.stderr.strip() or "Unknown error"
+            return f"Error: Grep command failed with return code {result.returncode}: {error_msg}"
+        output = result.stdout
+        if not output.strip():
+            return "No matches found for pattern in codebase."
+        return output
+
+    def search_in_file(self, file_path: str, search_term: str) -> str:
+        def extract_matches(filepath, term, max_output_lines=1000):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except Exception as e:
+                return f"Error reading '{filepath}': {e}"
+            match = re.escape(term)
+            match_lines = [i + 1 for i, line in enumerate(lines) if match in line]
+            if not match_lines:
+                return f"'{term}' not found in file '{filepath}'"
+            context = 20
+            seen = set()
+            chunks = []
+            for ln in match_lines:
+                start = max(1, ln - context)
+                end = min(len(lines), ln + context)
+                rkey = (start, end)
+                if rkey in seen:
+                    continue
+                seen.add(rkey)
+                chunk = lines[start - 1 : end]
+                chunks.append(f"(lines {start}-{end}):\n" + "\n".join(chunk))
+            return Utils.limit_strings("\n\n".join(chunks), n=max_output_lines)
+        output = extract_matches(file_path, search_term)
+        return output
+
+class EnhancedToolManager:
+    TOOL_LIST = {}
+
+    def __init__(self, **kwargs):
+        pass
+
+    def get_tool_docs(self) -> str:
+        return "\n\n".join([json.dumps(tool_metadata, ensure_ascii=False) for _, tool_metadata in self.TOOL_LIST.items()])
+
+    @classmethod
+    def tool_parsing(cls, fn):
+        tool_schemas = None
+        name = fn.__name__
+        doc_fn = fn.__doc__ or ""
+        doc = doc_fn.split("Arguments:")[0]
+        output_description = doc_fn.split("Output:")
+        if len(output_description) > 1:
+            output_description = "Output: " + output_description[1].strip()
+            doc = doc + "\n\n" + output_description
+        sig = inspect.signature(fn)
+        properties = {}
+        required = []
+        for param in sig.parameters.values():
+            if param.name == "self":
+                continue
+            if param.default is param.empty and param.kind in (
+                param.POSITIONAL_OR_KEYWORD,
+                param.KEYWORD_ONLY,
+            ):
+                required.append(param.name)
+            type_hint = str(param.annotation) if param.annotation != param.empty else "string"
+            param_description = re.search(f"{param.name}:([^\n]+)", doc_fn)
+            if param_description:
+                param_description = param_description.group(1)
+            else:
+                raise ValueError(f"Parameter description not found for {param.name} in {doc_fn}: tool name: {name}")
+            if ("list" in type_hint.lower()) and ("str" in type_hint):
+                properties[param.name] = {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": param_description,
+                }
+                continue
+            elif "str" in type_hint:
+                json_type = "string"
+            elif "int" in type_hint:
+                json_type = "integer"
+            elif "float" in type_hint:
+                json_type = "number"
+            elif "bool" in type_hint:
+                json_type = "boolean"
+            else:
+                json_type = "string"
+            properties[param.name] = {
+                "type": json_type,
+                "description": param_description,
+            }
+        parameters = {"type": "object", "properties": properties, "required": required}
+        tool_schemas = {
+            "name": name,
+            "description": doc.strip(),
+            "input_schema": parameters,
+        }
+        return tool_schemas
+
+    def get_tool(self, tool_name: str):
+        if tool_name not in self.TOOL_LIST:
+            return f"Error: tool '{tool_name}' not found"
+        tool_method = getattr(self, tool_name, None)
+        if tool_method is None or not callable(tool_method):
+            return f"Error: tool '{tool_name}' does not exist. Please use one of the following tools: {', '.join(self.TOOL_LIST.keys())}"
+        return tool_method
+
+    def tool(fn):
+        def wrapper(self, *args, **kwargs):
+            self.tool_invocations[fn.__name__] = self.tool_invocations.get(fn.__name__, 0) + 1
+            try:
+                return fn(self, *args, **kwargs)
+            except EnhancedToolManager.Error as e:
+                if fn.__name__ not in self.tool_failure:
+                    self.tool_failure[fn.__name__] = {j: 0 for j in self.Error.ErrorType.__members__}
+                self.tool_failure[fn.__name__][e.error_type] += 1
+                return e.message
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        wrapper.__signature__ = inspect.signature(fn)
+        wrapper.__annotations__ = fn.__annotations__.copy()
+        wrapper.is_tool = True
+        return wrapper
+
+    @classmethod
+    def get_tool_args_for_tool(cls, tool_name: str, required_only: bool = False) -> list[str]:
+        if tool_name not in cls.TOOL_LIST:
+            return f"Error: tool '{tool_name}' not found"
+        if not required_only:
+            return list(cls.TOOL_LIST[tool_name]["input_schema"]["properties"].keys())
+        else:
+            return cls.TOOL_LIST[tool_name]["input_schema"]["required"]
+
+    def get_final_git_patch(self) -> str:
+        try:
+            exclude = {"src/agent.py", "src/agent_runner.py"}
+            try:
+                for _p in getattr(self, "generated_test_files", []):
+                    if os.path.exists(_p) and os.path.isfile(_p):
+                        exclude.add(os.path.relpath(_p))
+            except Exception:
+                pass
+
+            # Get only modified files (not newly created/untracked files)
+            ls = subprocess.run(
+                ["git", "ls-files", "-m", "--exclude-standard"], capture_output=True, text=True, timeout=30, check=True
+            ).stdout.splitlines()
+
+            to_add = [f for f in ls if f not in exclude]
+            if to_add:
+                subprocess.run(["git", "add", "--"] + to_add, check=True, timeout=30)
+
+            diff = subprocess.run(["git", "diff", "--cached", "--no-color", "--unified=3"], capture_output=True, text=True, timeout=30, check=True)
+
+            if diff.stderr:
+                logger.warning("git diff (stderr): %s", diff.stderr.strip())
+
+            patch_text = diff.stdout or ""
+            return patch_text
+        except Exception as e:
+            return f"Error generating git patch: {e}"
+
+    @classmethod
+    def get_modified_files_list(
+        cls,
+    ) -> list[str]:
+        """
+        Get a list of modified tracked files. Does NOT modify the repository state.
+        """
+        try:
+            result = subprocess.run(["git", "diff", "--diff-filter=M", "--name-only"], capture_output=True, text=True, timeout=30, check=True)
+            files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+            return files
+        except Exception as e:
+            logger.error(f"Error getting modified files list: {e}")
+            return []
+
+
+    class Error(Exception):
+        class ErrorType(Enum):
+            SYNTAX_ERROR = 1
+            RUNTIME_ERROR = 2
+            TIMEOUT = 3
+            FILE_NOT_FOUND = 4
+            SEARCH_TERM_NOT_FOUND = 5
+            UNKNOWN = 6
+            THIRD_PARTY_DEPENDENCIES = 7
+            MULTIPLE_SEARCH_RESULTS_FOUND = 8
+            BUG_REPORT_REQUIRED = 9
+            INVALID_RESPONSE_FORMAT = 10
+            INVALID_TOOL_NAME = 11
+            INVALID_FILE_PATH = 12
+            INVALID_TOOL_CALL = 13
+            IMPORT_ERROR = 14
+        def __init__(self, error_type: ErrorType, message: str):
+            self.error_type = error_type
+            self.message = message
+
+class FixTaskEnhancedToolManager(EnhancedToolManager):
+
+    generated_test_files = []
+
+    def __init__(
+        self,
+        available_tools: Optional[list[str]] = [],
+        runner_hint: str | None = None,
+        runner_mode_hint: str | None = None,
+        initial_checkpoint=None,
+        problem_statement: str = None,
+        should_review: bool = False,
+    ):
+        self.new_files_created = []
+        self.available_tools = available_tools
+        self.runner_hint = runner_hint
+        self.runner_mode_hint = runner_mode_hint
+        self.initial_checkpoint = initial_checkpoint
+        self.observation_dir = ".observation"
+        self.problem_statement = problem_statement
+        self.repo_dir = "."
+        self.saved_observation_counter = 0
+        self.is_reviewed = not should_review
+        self.file_by_file_reviewed = not should_review
+        # Initialize hypothesis and strategy tracking
+        self.hypothesis_counter = 0
+        self.hypotheses = []
+        self.strategy_counter = 0
+        self.strategies = []
+        os.makedirs(self.observation_dir, exist_ok=True)
+        self.file_ops = FileOperationsUtil(new_files_created=self.new_files_created)
+        self.search_manager = SearchManager()
+        self.file_system_manager = FileSystemManager()
+        self.test_manager = TestManager(
+            runner_hint=runner_hint,
+            runner_mode_hint=runner_mode_hint,
+            file_ops=self.file_ops,
+        )
+        self.code_edit_manager = CodeEditManager(file_ops=self.file_ops)
+        self.code_parser = CodeParseUtil()
+        self.thought_history: list[dict[str, Any]] = []
+        self.branches: dict[str, list[dict[str, Any]]] = {}
+        self.file_ops.set_managers(self.file_system_manager, self.search_manager)
+        self.TOOL_LIST = {}
+        for cls in self.__class__.__mro__:
+            for name, attr in cls.__dict__.items():
+                if getattr(attr, "is_tool", False) and name not in self.TOOL_LIST:
+                    if available_tools is not None and name not in available_tools:
+                        continue
+                    self.TOOL_LIST[name] = self.__class__.tool_parsing(attr)
+        self.tool_failure = {k: {j: 0 for j in self.Error.ErrorType.__members__} for k in self.TOOL_LIST.keys()}
+        self.tool_invocations = {k: 0 for k in self.TOOL_LIST.keys()}
+        self.finish_called_count = 0
+    def _save_large_observation(self, observation: str, tool_name: str) -> str:
+        self.saved_observation_counter += 1
+        filename = f"observation_{self.saved_observation_counter}_{tool_name}_{int(time.time())}.txt"
+        if not os.path.exists(self.observation_dir):
+            os.makedirs(self.observation_dir, exist_ok=True)
+        file_path = os.path.join(self.observation_dir, filename)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(observation)
+            return file_path
+        except Exception as e:
+            return f"Error: Failed to save observation: {e}"
+
+    @EnhancedToolManager.tool
+    def think(self, thought: str) -> str:
+        """Use the tool to think about something. It will not make any changes to the repository. Use it when reasoning or brainstorming is needed. For example, if you explore the repo and discover the source of a bug, call this tool to brainstorm several unique ways of fixing the bug, and assess which change(s) are likely to be correct and most effective. Alternatively, if you receive some test results, you can call this tool to brainstorm ways to fix the failing tests.
+        Arguments:
+            thought: Your thoughts.
+        Output:
+            Confirmation that the thought has been logged.
+        """
+        return "ok"
+
+    @EnhancedToolManager.tool
+    def ask_another_guy(self, questions: List[str]) -> str:
+        """
+        A creativity-boosting assistant tool designed to help escape repetitive reasoning, local optima, or stagnant thought patterns.
+        When the current model is looping, overfitting to a single line of reasoning, or failing to make progress, this tool provides fresh perspectives by querying a different LLM model with high randomness (high temperature).
+
+        Use this tool when:
+        - Reasoning starts to repeat or loop
+        - Progress stalls despite multiple attempts
+        - The solution seems trapped in a local optimum
+        - A radically different viewpoint or idea is needed
+        - Creative or unconventional thinking may unlock progress
+
+        The tool sends questions to a different LLM than the current one with high temperature to encourage divergent thinking, unconventional ideas, and non-obvious solution paths. Responses are intended to be inspirational and exploratory, not necessarily precise or final.
+
+        Arguments:
+            questions: A list of questions or prompts that require fresh or creative thinking.
+        Output:
+            A list of creatively generated responses, each corresponding to an input question. Answers may be speculative, unconventional, or incomplete by design. Treat outputs as idea generators, not authoritative solutions. Always validate and refine insights using the primary model and available tools.
+        """
+        if not questions or not isinstance(questions, list):
+            return "Error: questions must be a non-empty list of strings"
+
+        if not all(isinstance(q, str) and q.strip() for q in questions):
+            return "Error: All questions must be non-empty strings"
+
+        # Select a different model from the current one
+        # Use models with higher temperature for creative thinking
+        available_models = [GLM_MODEL_NAME, KIMI_MODEL_NAME, QWEN_MODEL_NAME]
+
+        # Try to get a different model (avoid the current one if known)
+        current_model = getattr(self, "_selected_model", None)
+        if current_model and current_model in available_models:
+            # Remove current model from available options
+            available_models = [m for m in available_models if m != current_model]
+
+        # If no models available after filtering, use all models
+        if not available_models:
+            available_models = [GLM_MODEL_NAME, KIMI_MODEL_NAME, QWEN_MODEL_NAME]
+
+        selected_model = random.choice(available_models)
+
+        answers = []
+        for question in questions:
+            retry = 0
+            max_retries = 3
+            while retry < max_retries:
+                try:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a creative problem-solving assistant. Provide fresh, unconventional, and exploratory perspectives. Think divergently and suggest non-obvious approaches. Your goal is to inspire new ways of thinking, not to provide definitive answers.",
+                        },
+                        {"role": "user", "content": question},
+                    ]
+                    # Use high temperature (0.8-1.0) for creative, divergent thinking
+                    response, _ = EnhancedNetwork.make_request(messages=messages, model=selected_model, temperature=0.9)
+                    answers.append(response.strip())
+                    break
+                except Exception as e:
+                    retry += 1
+                    if retry >= max_retries:
+                        answers.append(f"Error: Failed to get creative response after {max_retries} attempts: {str(e)}")
+                    else:
+                        # Try a different model on retry
+                        other_models = [m for m in available_models if m != selected_model]
+                        if other_models:
+                            selected_model = random.choice(other_models)
+                        time.sleep(1)
+
+        result = "Creative perspectives from alternative thinking:\n\n"
+        for i, (question, answer) in enumerate(zip(questions, answers), 1):
+            result += f"Question {i}: {question}\n"
+            result += f"Creative Response {i}: {answer}\n\n"
+
+        result += "\nNote: These responses are exploratory and creative by design. Validate and refine insights using systematic reasoning and available tools."
+
+        return result
+
+    @EnhancedToolManager.tool
+    def apply_code_edit(self, file_path: str, search: str, replace: str) -> str:
+        """
+        Performs targeted text replacement within source files. If there are any syntax errors in the code, it rejects the edit with an error message.
+        Arguments:
+            file_path: target file for modification
+            search: exact text pattern to locate and replace
+            replace: new text content to substitute
+        Output:
+            operation status - success confirmation or detailed error with guidance
+        """
+        return self.code_edit_manager.apply_code_edit(file_path=file_path, search=search, replace=replace)
+
+    @EnhancedToolManager.tool
+    def list_directory_structure(self, directory_path: str = ".", max_depth: int = 1) -> str:
+        """
+        Lists the directory structure of the repository
+        Arguments:
+            directory_path: the directory path to list (default: ".")
+            max_depth: maximum depth to traverse (default: 1)
+        """
+        return self.file_system_manager.list_directory_structure(directory_path=directory_path, max_depth=max_depth)
+
+    @EnhancedToolManager.tool
+    def run_code(self, content: str, file_path: str, run_command: List[str]) -> str:
+        """
+        Runs any code. You can use this tool directly to run any test code or bug reproduction code.
+        Saves the code at the given file_path and then runs it. Do not use this tool to create test or files to reproduce the error unless user has specifically asked you to create test files as part of problem statement.
+        Arguments:
+            content: text code to write in file
+            file_path: path of the file to save the code in. This file should always be in the current working directory.
+            run_command: command to run the file (i.e., ["python", "file.py"] or ["node", "file.js"] etc)
+        """
+        return self.test_manager.run_code(
+            content=content,
+            file_path=file_path,
+            generated_test_files=self.generated_test_files,
+            run_command=run_command,
+        )
+
+    @EnhancedToolManager.tool
+    def run_tests(self, command: List[str], timeout: int = 5) -> str:
+        """
+        Runs tests with strict timeout.
+        Arguments:
+            command: list of command line arguments,
+            timeout: timeout in seconds (default: 5)
+        Output:
+            Standard output or error output of the command.
+        """
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            return result.stdout + result.stderr
+        except subprocess.TimeoutExpired:
+            return "Test run timed out."
+        except Exception as e:
+            return f"Test execution error: {e}"
+
+    @EnhancedToolManager.tool
+    def get_function_body(self, file_path: str, function_name: str) -> str:
+        """
+        Retrieves the complete body of a function from a file, including decorators.
+        Arguments:
+            file_path: filesystem path to target file.
+            function_name: name of the function to retrieve (supports both qualified names like "ClassName.method_name" and simple names like "method_name").
+        Returns:
+            The complete function body including decorators, or empty string if function not found.
+        """
+        return self.code_parser.get_function_body(file_path, function_name, add_line_numbers=True)
+
+    @EnhancedToolManager.tool
+    def get_file_content(
+        self,
+        file_path: str,
+        search_term: str = None,
+    ) -> str:
+        """
+        Retrieves file contents with optional filtering based on search term
+        Arguments:
+            file_path: filesystem path to target file.
+            search_term: optional text pattern to filter matching lines
+        """
+        return self.file_ops.get_file_content(
+            file_path,
+            search_term=search_term,
+            add_line_numbers=True,
+        )
+
+    @EnhancedToolManager.tool
+    def search_in_files(self, grep_search_command: str) -> str:
+        """
+        Performs grep search across all files in the codebase
+        Arguments:
+            grep_search_command: grep search command to locate (e.g., "grep <your grep command>").
+        Output:
+            locations where pattern was found with file paths and line numbers
+        """
+        return self.search_manager.search_in_all_files(grep_search_command)
+
+    @EnhancedToolManager.tool
+    def finish_find_files_to_fix(self, files: List[str]):
+        """
+        Signals completion of the file finding workflow execution
+        Arguments:
+            files: The list of files to fix.
+        """
+        self.files_to_fix = files
+        return files
+
+    def get_final_git_patch(self) -> str:
+        try:
+            exclude = {"src/agent.py", "src/agent_runner.py"}
+            try:
+                for _p in getattr(self, "generated_test_files", []):
+                    if os.path.exists(_p) and os.path.isfile(_p):
+                        exclude.add(os.path.relpath(_p))
+            except Exception:
+                pass
+
+            # Get only modified files (not newly created/untracked files)
+            ls = subprocess.run(
+                ["git", "ls-files", "-m", "--exclude-standard"], capture_output=True, text=True, timeout=30, check=True
+            ).stdout.splitlines()
+
+            to_add = [f for f in ls if f not in exclude]
+            if to_add:
+                subprocess.run(["git", "add", "--"] + to_add, check=True, timeout=30)
+
+            diff = subprocess.run(["git", "diff", "--cached", "--no-color", "--unified=3"], capture_output=True, text=True, timeout=30, check=True)
+
+            if diff.stderr:
+                logger.warning("git diff (stderr): %s", diff.stderr.strip())
+
+            patch_text = diff.stdout or ""
+            return patch_text
+        except Exception as e:
+            return f"Error generating git patch: {e}"
+
+    @EnhancedToolManager.tool
+    def modify_test_case(self, file_path: str, search: str, replace: str) -> str:
+        """
+        Modifies test files or test cases when they are incorrect or need correction.
+        Use this tool when you identify that a test file or specific test case is wrong and needs to be fixed.
+        This tool uses the same underlying mechanism as apply_code_edit but is specifically intended for correcting test files.
+        Arguments:
+            file_path: path to the test file that needs modification
+            search: exact text pattern in the test file to locate and replace (e.g., the incorrect test case code)
+            replace: corrected test case code to substitute
+        Output:
+            Operation status - success confirmation or detailed error with guidance
+        """
+        return self.code_edit_manager.apply_code_edit(file_path=file_path, search=search, replace=replace)
+
+    @EnhancedToolManager.tool
+    def run_shell_cmd(self, command: str) -> str:
+        '''
+        Runs shell commands for the repository. This tool executes shell commands directly.
+        Arguments:
+            command: A shell command to be run.
+        Output:
+            The stdout results of the command. Your working directory is the root of the project.
+        '''
+        if not command:
+            return "Error: No command provided."
+        
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=150
+            )
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[stderr]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            return output
+        except subprocess.TimeoutExpired:
+            return f"Error: Command '{command}' timed out after 150 seconds"
+        except Exception as e:
+            return f"Error running command: {str(e)}"
+
+    @EnhancedToolManager.tool
+    def finish(self):
+        """
+        Signals completion of the current workflow execution. Validates patch application before finishing.
+        Arguments:
+            None
+        Output:
+            Review patch prompt with validation results, or "finish" if called 5+ times (for fix tasks) or 1+ times (for create tasks)
+        """
+
+        # Validate patch application before finishing
+        validation_result = self.validate_patch_application()
+
+        # Generate review patch prompt based on validation result
+        if "Patch validation passed" in validation_result:
+            return "finish"
+        elif "Patch validation failed" in validation_result or "Patch validation error" in validation_result:
+            review_prompt = textwrap.dedent(
+                """
+                ⚠️ Patch Validation: FAILED
+                
+                The patch validation detected issues that may prevent successful application.
+                Please review and fix the following issues before finalizing:
+                
+                {validation_result}
+                
+                Common fixes:
+                - Replace raw newlines (actual line breaks) in strings with \\n escape sequences
+                - Ensure unified diff format is correct (proper @@ hunk headers with line counts)
+                - Remove control characters (\\r, \\0) from file content
+                - Check for encoding issues (ensure UTF-8 encoding)
+                - Verify file paths in the patch match actual file locations
+                
+                After fixing the issues, you can call validate_patch_application again to verify.
+                """
+            ).format(validation_result=validation_result)
+        else:
+            # Validation was skipped or returned a message
+            review_prompt = textwrap.dedent(
+                """
+                ℹ️ Patch Validation: {validation_result}
+                
+                Please review your changes before finalizing.
+                """
+            ).format(validation_result=validation_result)
+
+        return review_prompt.strip()
+
+    def validate_patch_application(self) -> str:
+        """
+        Validates that the current patch can be applied successfully without errors.
+        This tool tests patch application by: generating patch from clean state, applying it to clean state,
+        and verifying it works. This prevents generating patches that fail when applied later due to issues
+        like raw newlines in strings, malformed unified diff format, or incorrect hunk line counts.
+        Arguments:
+            None
+        Output:
+            Validation result - "Patch validation passed" if successful, or detailed error message
+            explaining why the patch failed to apply (e.g., corrupt patch, line count mismatches,
+            raw newlines in strings, etc.)
+        """
+        try:
+            # First, unstage any previously staged changes to ensure clean patch generation
+            subprocess.run(["git", "reset", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+
+            # Get list of modified files (both staged and unstaged) using git status --porcelain
+            # This is more reliable than git ls-files or git diff, especially in detached HEAD state
+            status_result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=30, check=False)
+
+            if status_result.returncode != 0 or not status_result.stdout.strip():
+                return "Patch validation skipped: No modified files to validate"
+
+            # Parse porcelain output: first 2 chars are status, then space(s), then filename
+            # M = modified, A = added, D = deleted, R = renamed
+            # Status format: XY where X = index status, Y = working tree status
+            # We want files that are modified (M) or added (A) in working tree or index
+            # Note: We exclude deleted (D) and untracked (??) files as they can't be patched
+            modified_files = []
+            for line in status_result.stdout.splitlines():
+                line = line.rstrip()  # Only strip right side to preserve leading spaces if any
+                if not line or len(line) < 3:
+                    continue
+
+                # Get status code (first 2 characters)
+                status = line[:2]
+
+                # Handle renamed files (format: "R100 old_file -> new_file" or "R  old_file -> new_file")
+                if status[0] == "R" or status[1] == "R":
+                    # For renamed files, we want the new filename (after ->)
+                    if " -> " in line:
+                        filepath = line.split(" -> ", 1)[1].strip()
+                    else:
+                        # Fallback: skip renamed files if format is unexpected
+                        continue
+                else:
+                    # Regular files: format is "XY filename" where XY is 2-char status
+                    # After the 2-char status, there are one or more spaces, then the filename
+                    # Examples:
+                    #   " M filename" (leading space + M + space + filename)
+                    #   "M  filename" (M + 2 spaces + filename)
+                    #   "MM filename" (MM + space + filename)
+                    #   "?? filename" (untracked)
+
+                    # Find first non-space character after the 2-char status
+                    # This should be the start of the filename (or a quote if filename has spaces)
+                    filename_start = 2
+                    while filename_start < len(line) and line[filename_start] == " ":
+                        filename_start += 1
+
+                    if filename_start >= len(line):
+                        # No filename found, skip
+                        continue
+
+                    # Get filename part
+                    remaining = line[filename_start:].strip()
+
+                    # Handle quoted filenames (for files with spaces)
+                    if remaining.startswith('"') and remaining.endswith('"'):
+                        # Remove quotes and unescape
+                        filepath = remaining[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                    else:
+                        filepath = remaining
+
+                # Check if file is modified (M) or added (A) - exclude deleted (D) and untracked (??)
+                # We only want files we can actually patch
+                if any(c in status for c in ["M", "A"]) and "D" not in status and "?" not in status:
+                    modified_files.append(filepath)
+
+            if not modified_files:
+                return "Patch validation skipped: No modified files to validate"
+
+            # Exclude agent files
+            exclude = {"src/agent.py", "src/agent_runner.py"}
+            try:
+                for _p in getattr(self, "generated_test_files", []):
+                    if os.path.exists(_p) and os.path.isfile(_p):
+                        exclude.add(os.path.relpath(_p))
+            except Exception:
+                pass
+
+            modified_files = [f for f in modified_files if f not in exclude]
+
+            if not modified_files:
+                return "Patch validation skipped: No relevant modified files to validate"
+
+            # Stash current changes to get a clean state
+            stash_result = subprocess.run(
+                ["git", "stash", "push", "-m", "temp_validation_stash", "--"] + modified_files,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            if stash_result.returncode != 0:
+                return f"Patch validation error: Failed to stash changes. {stash_result.stderr}"
+
+            stash_applied = True
+
+            try:
+                # Generate patch from the stash (which contains our changes)
+                # The stash contains the diff we want to validate
+                stash_diff_result = subprocess.run(
+                    ["git", "stash", "show", "-p", "--no-color", "--unified=3", "stash@{0}"], capture_output=True, text=True, timeout=30, check=False
+                )
+
+                if stash_diff_result.returncode != 0:
+                    # Fallback: restore from stash, stage, generate patch, then restore stash
+                    subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                    stash_applied = False
+
+                    # Stage the files
+                    if modified_files:
+                        subprocess.run(["git", "add", "--"] + modified_files, capture_output=True, text=True, timeout=30, check=False)
+
+                    # Generate patch
+                    diff_result = subprocess.run(
+                        ["git", "diff", "--cached", "--no-color", "--unified=3"], capture_output=True, text=True, timeout=30, check=False
+                    )
+
+                    # Unstage
+                    subprocess.run(["git", "reset", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+
+                    # Stash again
+                    stash_result2 = subprocess.run(
+                        ["git", "stash", "push", "-m", "temp_validation_stash", "--"] + modified_files,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if stash_result2.returncode == 0:
+                        stash_applied = True
+
+                    patch_text = diff_result.stdout or ""
+                else:
+                    patch_text = stash_diff_result.stdout or ""
+
+                if not patch_text.strip():
+                    # Restore and return
+                    if stash_applied:
+                        subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                        stash_applied = False
+                    return "Patch validation skipped: No changes to validate (empty patch)"
+
+                # Create a temporary patch file
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as tmp_file:
+                    tmp_file.write(patch_text)
+                    patch_file = tmp_file.name
+
+                try:
+                    # Test patch application using git apply --check (dry run)
+                    check_result = subprocess.run(["git", "apply", "--check", patch_file], capture_output=True, text=True, timeout=30, check=False)
+
+                    if check_result.returncode == 0:
+                        # If check passes, try actual application
+                        apply_result = subprocess.run(["git", "apply", patch_file], capture_output=True, text=True, timeout=30, check=False)
+
+                        # Reset to clean state after applying
+                        subprocess.run(["git", "reset", "--hard", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+                        subprocess.run(["git", "clean", "-fd"], capture_output=True, text=True, timeout=10, check=False)
+
+                        if apply_result.returncode == 0:
+                            # Restore stashed changes
+                            subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                            return "Patch validation passed: Patch can be applied successfully"
+                        else:
+                            error_msg = apply_result.stderr.strip() or apply_result.stdout.strip() or "Unknown error"
+                            # Restore stashed changes even on failure
+                            subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                            return f"Patch validation failed: Patch cannot be applied. Error: {error_msg}\n\nCommon causes:\n- Raw newlines inside quoted strings (use \\n instead)\n- Malformed unified diff format\n- Incorrect hunk line counts\n- Control characters (\\r, \\0) in file content\n- Encoding issues"
+                    else:
+                        error_msg = check_result.stderr.strip() or check_result.stdout.strip() or "Unknown error"
+                        # Restore stashed changes
+                        subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                        return f"Patch validation failed: Patch check failed. Error: {error_msg}\n\nCommon causes:\n- Raw newlines inside quoted strings (use \\n instead)\n- Malformed unified diff format\n- Incorrect hunk line counts\n- Control characters (\\r, \\0) in file content\n- Encoding issues"
+                finally:
+                    # Clean up temporary patch file
+                    try:
+                        os.unlink(patch_file)
+                    except Exception:
+                        pass
+            except Exception as e:
+                # Restore stashed changes if something went wrong
+                if stash_applied:
+                    try:
+                        subprocess.run(["git", "reset", "--hard", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
+                        subprocess.run(["git", "clean", "-fd"], capture_output=True, text=True, timeout=10, check=False)
+                        subprocess.run(["git", "stash", "pop"], capture_output=True, text=True, timeout=10, check=False)
+                    except Exception:
+                        pass
+                return f"Patch validation error during application test: {str(e)}"
+        except Exception as e:
+            return f"Patch validation error: {str(e)}"
+
+def execute_agent_workflow(
+    cot: EnhancedCOT,
+    tool_manager: EnhancedToolManager,
+    system_prompt: str,
+    instance_prompt: str,
+    n_max_steps: int,
+    timeout: int,
+    models: List[str],
+    log_prefix: str = "AGENT",
+    finish_tool_name="finish",
+    reject_observation_token_threshold: int = 50000,
+    save_observation_to_file_token_threshold: int = 4000,
+) -> str:
+    global run_id
+    logger.info(f"{log_prefix} Starting agent execution... ")
+    # Set cot reference in tool manager so code-expert LLM can access chat history
+    if hasattr(tool_manager, "cot"):
+        tool_manager.cot = cot
+    start_time = time.time()
+    raw_text = ""
+    total_attempts = 0
+    error_counter = {}
+    next_thought = None
+    next_tool_name = None
+    next_tool_args = None
+    modified_files = set()
+    files_with_syntax_errors = set()
+    current_model_index = 0
+    initial_modified_files = EnhancedToolManager.get_modified_files_list()
+
+    def _safe_call_tool(tool_manager: EnhancedToolManager, tool_name: str, tool_args):
+        """
+        General safety layer:
+        - If get_tool returns an error string, return it as observation (don't crash)
+        - Drop unexpected kwargs (prevents occasional 'unexpected keyword argument' failures)
+        - Coerce common "list[str]" args passed as a single string (e.g. "ls -l")
+        """
+        tool_fn = tool_manager.get_tool(tool_name)
+        if isinstance(tool_fn, str):
+            return tool_fn
+
+        if tool_args is None or tool_args == {}:
+            return tool_fn()
+        if not isinstance(tool_args, dict):
+            # If model returned something weird, don't crash
+            return tool_fn()
+
+        # Filter kwargs to what the tool actually accepts
+        try:
+            sig = inspect.signature(tool_fn)
+            allowed = set(sig.parameters.keys())
+            allowed.discard("self")
+        except Exception:
+            allowed = set(tool_args.keys())
+
+        cleaned = {k: v for k, v in tool_args.items() if k in allowed}
+
+        # Light coercion for list-like params if the model returns a single string
+        try:
+            for k in list(cleaned.keys()):
+                v = cleaned[k]
+                p = sig.parameters.get(k)
+                ann = str(getattr(p, "annotation", ""))
+                if v is not None and isinstance(v, str) and ("List" in ann or "list" in ann):
+                    # Turn "ls -l" into ["ls", "-l"]
+                    cleaned[k] = v.split() if v.strip() else []
+        except Exception:
+            pass
+
+        return tool_fn(**cleaned) if cleaned else tool_fn()
+
+    for step in range(n_max_steps):
+        selected_model = models[current_model_index]
+        elapsed_time = time.time() - start_time
+        logger.info("=" * 40 + f"[{log_prefix}] Step {step}" + "=" * 40)
+        cost_usage = EnhancedNetwork.get_cost_usage()
+        logger.info(
+            f"[{log_prefix}] Elapsed time: {elapsed_time}/{timeout} seconds, Usage: {cost_usage.get('used_cost_usd', 0)}/ {cost_usage.get('max_cost_usd', 0)} USD"
+        )
+        if cost_usage.get("used_cost_usd", 0) > cost_usage.get("max_cost_usd", 0):
+            logger.warning(f"[{log_prefix}] Usage exceeded limit: {cost_usage.get('used_cost_usd', 0)}/ {cost_usage.get('max_cost_usd', 0)} USD")
+            break
+        if time.time() - start_time > timeout:
+            logger.info(f"[{log_prefix}] Global timeout reached")
+            cot.add_action(
+                EnhancedCOT.Action(
+                    next_thought="global timeout reached",
+                    next_tool_name="",
+                    next_tool_args={},
+                    observation="",
+                    is_error=True,
+                    inference_error_counter={},
+                    request_data=[],
+                )
+            )
+            break
+        # Include initial modified files as context (these may already be correct)
+        modified_files_context = ""
+        if initial_modified_files:
+            modified_files_context = f"\n\nNote: The following files were already modified before starting: {', '.join(initial_modified_files)}."
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instance_prompt + modified_files_context},
+        ]
+        messages.extend(cot.to_str())
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+
+        if cot.is_thought_repeated():
+            logger.info(f"[TEMPERATURE] Thought repeated {cot.repeated_thoughts} times")
+            last_thought = cot.thoughts[-1]
+            messages.append(
+                {
+                    "role": "user",
+                    "content": MAKE_REAL_PROGRESS.format(
+                        previous_response=f"next_thought:{last_thought.next_thought}\n next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}"
+                    ),
+                }
+            )
+            temperature = 0.6
+            if cot.repeated_thoughts >= 2:
+                model_idx = (cot.repeated_thoughts - 2) % len(models)
+                selected_model = models[model_idx]
+        else:
+            temperature = 0.3
+
+        try:
+            inference_start_time = time.time()
+            models_to_try = [selected_model] + [m for m in models if m != selected_model]
+            (
+                next_thought,
+                next_tool_name,
+                next_tool_args,
+                raw_text,
+                total_attempts,
+                error_counter,
+                messages,
+                used_model,
+            ) = EnhancedNetwork.inference(messages, model=models_to_try, run_id=run_id, temperature=temperature)
+            selected_model = used_model
+            inference_duration = time.time() - inference_start_time
+        except Exception as e:
+            inference_duration = 0
+            logger.error(f"[{log_prefix}] Inference error: {e}")
+            is_timeout_error = "Agent execution timeout" in str(e)
+            if is_timeout_error:
+                cot.add_action(
+                    EnhancedCOT.Action(
+                        next_thought="global timeout reached",
+                        next_tool_name="",
+                        next_tool_args={},
+                        observation="",
+                        is_error=True,
+                        inference_error_counter={},
+                        request_data=[],
+                    )
+                )
+                return tool_manager.get_final_git_patch()
+
+        tool_names_list = next_tool_name if isinstance(next_tool_name, list) else [next_tool_name]
+        tool_args_list = next_tool_args if isinstance(next_tool_args, list) else [next_tool_args]
+
+        logger.info(f"[{log_prefix}] Used model: {selected_model}, Inference time: {inference_duration:.2f}s")
+        logger.info(f"[{log_prefix}] Next thought: {next_thought}\n\n")
+        logger.info(f"[{log_prefix}] About to execute {len(tool_names_list)} tool call(s): {tool_names_list}\n")
+        logger.info(f"[{log_prefix}] Tool arguments: {json.dumps(tool_args_list, indent=4)}\n\n")
+
+        tool_manager._current_step = step
+        tool_manager._cot_snapshot_cache = [
+            {
+                "thought": t.next_thought,
+                "tool": t.next_tool_name,
+                "args": str(t.next_tool_args)[:200],
+                "success": not t.is_error,
+            }
+            for t in cot.thoughts[-10:]
+        ]
+        all_observations = []
+        all_successful = True
+        for idx, (tool_name, tool_args) in enumerate(zip(tool_names_list, tool_args_list)):
+            try:
+                if '"' in tool_name or "'" in tool_name:
+                    tool_name = tool_name.replace('"', "").replace("'", "")
+                observation = _safe_call_tool(tool_manager, tool_name, tool_args)
+                if tool_name == "apply_code_edit" and tool_args and "file_path" in tool_args:
+                    file_path = tool_args["file_path"]
+                    if "ok, code edit applied successfully" in str(observation).lower():
+                        modified_files.add(file_path)
+                    elif "syntax error" in str(observation).lower():
+                        files_with_syntax_errors.add(file_path)
+                estimated_tokens = Utils.count_tokens(str(observation))
+                if estimated_tokens > reject_observation_token_threshold:
+                    observation = f"Error: Tool output from '{tool_name}' exceeded token limit ({estimated_tokens} tokens > 50000 tokens limit). The response is too large to process. Please use more specific queries, target smaller file ranges, or break the request into smaller operations."
+                elif estimated_tokens > save_observation_to_file_token_threshold:
+                    observation_path = tool_manager._save_large_observation(str(observation), tool_name)
+                    observation = f"Tool output from `{tool_name}` exceeded token limit ({estimated_tokens} tokens > 4000 tokens limit). The full output has been saved to: {observation_path}. You can read this file using the get_file_content tool if needed, but specify the start and end line numbers to read the file."
+                all_observations.append(observation)
+            except EnhancedToolManager.Error as e:
+                error_msg = f"Tool {idx+1} ({tool_name}) error: {e.message}"
+                all_observations.append(error_msg)
+                all_successful = False
+            except Exception as e:
+                import traceback
+
+                error_traceback = traceback.format_exc()
+                error_msg = f"Tool {idx+1} ({tool_name}) exception: {str(e)}\n{error_traceback}"
+                all_observations.append(error_msg)
+                all_successful = False
+
+        if len(all_observations) == 1:
+            combined_observation = all_observations[0]
+        else:
+            combined_observation = "\n\n--- Tool Call Results ---\n" + "\n\n".join(
+                [f"Tool {i+1} ({tool_names_list[i]}):\n{obs}" for i, obs in enumerate(all_observations)]
+            )
+
+        logger.info(f"[{log_prefix}] Combined observation: {combined_observation}\n\n")
+
+        cot.add_action(
+            EnhancedCOT.Action(
+                next_thought=next_thought,
+                next_tool_name=next_tool_name,  # Keep original format (list or single)
+                next_tool_args=next_tool_args,
+                observation=combined_observation,
+                is_error=not all_successful,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages,
+            )
+        )
+        if finish_tool_name in tool_names_list:
+            if finish_tool_name == "finish_find_files_to_fix":
+                for name, obs in zip(tool_names_list, all_observations):
+                    if name == finish_tool_name:
+                        return obs
+            elif finish_tool_name == "finish_investigation":
+                for name, obs in zip(tool_names_list, all_observations):
+                    if name == finish_tool_name:
+                        return obs
+            elif finish_tool_name == "finish":
+                for name, obs in zip(tool_names_list, all_observations):
+                    if name == finish_tool_name:
+                        if obs != "finish":
+                            break
+                        return tool_manager.get_final_git_patch()
+    return tool_manager.get_final_git_patch()
+
+def fix_task_solve_workflow(
+    problem_statement: str,
+    *,
+    timeout: int,
+    run_id_1: str,
+    enhancement: str,
+    n_max_steps=MAX_FIX_TASK_STEPS,
+    initial_checkpoint=None,
+    should_review: bool = True,
+) -> bool:
+    global run_id, _current_tool_manager
+    run_id = run_id_1
+    cot = EnhancedCOT(
+        latest_observations_to_keep=LATEST_OBSERVATIONS_TO_KEEP,
+        summarize_batch_size=SUMMARIZE_BATCH_SIZE,
+    )
+    tool_manager = FixTaskEnhancedToolManager(
+        available_tools=[
+            "think",
+            "list_directory_structure",
+            "get_file_content",
+            "get_function_body",
+            "search_in_files",
+            "apply_code_edit",
+            "run_code",
+            "run_tests",
+            "ask_another_guy",
+            "finish",
+        ],
+        initial_checkpoint=initial_checkpoint,
+        problem_statement=problem_statement,
+        should_review=should_review,
+    )
+    _current_tool_manager = tool_manager
+    system_prompt = FIX_TASK_SYSTEM_PROMPT.format(
+        tools_docs=tool_manager.get_tool_docs(),
+        problem_statement=problem_statement,
+        format_prompt=FORMAT_PROMPT_FIX,
+    )
+    enhanced_problem = problem_statement
+    if enhancement:
+        enhanced_problem = problem_statement + "\n\n---\n\n# Enhanced Problem Analysis\n\n" + enhancement
+    instance_prompt = INSTANCE_PROMPT_TEMPLATE.format(problem_statement=enhanced_problem)
+
+    execute_agent_workflow(
+        cot,
+        tool_manager,
+        system_prompt,
+        instance_prompt,
+        n_max_steps,
+        timeout,
+        [GLM_MODEL_NAME, QWEN_MODEL_NAME],
+        log_prefix="FIX_MAIN_AGENT",
+    )
+
+    modified_files = tool_manager.get_modified_files_list()
+    print(f"Modified files: {modified_files}")
+    return len(modified_files) > 0
+
+def process_fix_task(input_dict: Dict[str, Any], enhancement: str):
+    problem_text = input_dict.get("problem_statement")
+    workflow_timeout = DEFAULT_TIMEOUT - TIME_MARGIN_FOR_PATCH - TIME_PADDING_FOR_WORKFLOW - (time.time() - START_TIME)
+    if workflow_timeout <= 0:
+        print(format_log("PROCESS_FIX_TASK", "Workflow timeout is non-positive, skipping workflow"))
+        return
+    workflow_completed = threading.Event()
+    is_success_workflow = False
+    time_per_step = 15  # Estimated seconds per step
+    max_steps = min(MAX_FIX_TASK_STEPS, int(workflow_timeout / time_per_step))
+    max_steps = max(10, max_steps)  # At least 10 steps
+    
+    def run_workflow():
+        nonlocal is_success_workflow
+        try:
+            elapsed_time = time.time() - START_TIME
+            is_success_workflow = fix_task_solve_workflow(problem_text, timeout=1300 - elapsed_time, run_id_1=run_id, enhancement=enhancement, should_review=True)
+        except Exception as e:
+            logger.error(f"Error in fix_task_solve_workflow: {e}")
+            is_success_workflow = False
+        finally:
+            workflow_completed.set()
+    
+    workflow_thread = threading.Thread(target=run_workflow, daemon=True)
+    workflow_thread.start()
+    workflow_thread.join(timeout=workflow_timeout)
+    
+    timed_out = workflow_thread.is_alive()
+    if timed_out:
+        logger.warning(f"Workflow execution timed out after {workflow_timeout} seconds")
+    
+    print(format_log("PROCESS_FIX_TASK", "Fix task work flow successfully finished"))
+
+def make_inference_message_function(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned_msgs: List[Dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        content = m.get("content", "")
+        if role == "assistant" and not content.strip():
+            continue
+        cleaned_msgs.append({"role": role, "content": content})
+    if not cleaned_msgs:
+        logger.error("No valid messages after cleaning")
+        raise RuntimeError("No valid messages to send to proxy.")
+    return cleaned_msgs
+
+def set_env_for_agent():
+    if os.getcwd() not in os.environ.get("PYTHONPATH",""):
+        os.environ["PYTHONPATH"]=os.environ.get("PYTHONPATH","")+":"+os.getcwd()
+    if Path(os.getcwd()+"/lib").exists() and os.getcwd()+"/lib" not in os.environ.get("PYTHONPATH",""):
+        os.environ["PYTHONPATH"]=os.environ["PYTHONPATH"]+":"+os.getcwd()+"/lib"
+    work_dir = os.getcwd()
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(work_dir)
+        if not os.path.exists(".git"):
+            subprocess.run(["git", "init"], check=True)
+            subprocess.run(["git", "config", "--global", "--add", "safe.directory", work_dir])
+            subprocess.run(["git", "config", "--global", "user.email", "agent@sandbox.local"], check=True)
+            subprocess.run(["git", "config", "--global", "user.name", "sandbox_agent"], check=True)
+            subprocess.run(["git", "add", "."], check=True)
+            result = subprocess.run(["git", "commit", "-m", "Initial commit"], check=False, capture_output=True, text=True)
+        else:
+            subprocess.run(["git", "config", "--global", "--add", "safe.directory", work_dir])
+    except Exception as e:
+        logger.error(f"ERROR: Could not initialize git repository: {e}")
+    finally:
+        os.chdir(original_cwd)
+
+def get_problem_type(problem_statement: str, enhancement: str) -> str:
+    retry = 0
+    PROBLEM_TYPE_CHECK_PROMPT = textwrap.dedent(
+        """
+        You are a helpful Problem Classifier to find a Task Name from PROJECT DESCRIPTION and project structure.
+        Classify development tasks as either:
+        - FIX: If the PROJECT DESCRIPTION is about fixing a bug, creating a new functionality or improving the existing codebase.
+        - CREATE: If the PROJECT DESCRIPTION is about creating a new functionality from scratch.
+        Output ONLY: "CREATE" or "FIX"
+        """
+    )
+    selected_model = QWEN_MODEL_NAME
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": PROBLEM_TYPE_CHECK_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"{problem_statement}\n# Enhanced Problem: \n{enhancement}",
+                },
+            ]
+            response, _ = EnhancedNetwork.make_request(messages, model=selected_model, attempt=1)
+            if response not in [PROBLEM_TYPE_CREATE, PROBLEM_TYPE_FIX]:
+                retry += 1
+            else:
+                return response
+        except Exception as e:
+
+            retry += 1
+            if retry > 4:
+                other_models = [model for model in AGENT_MODELS if model != selected_model]
+                selected_model = other_models[random.randint(0, len(other_models) - 1)]
+            time.sleep(2)
+    return PROBLEM_TYPE_FIX
+
+def enhance_problem_statement(problem_statement: str) -> str:
+    ENHANCEMENT_PROMPT = textwrap.dedent(
+        """
+        You are an expert at analyzing problem statements and extracting key information.
+        Analyze the given problem statement and extract the following structured information:
+        1. **Problem Summary** (1-2 sentences): What needs to be fixed or implemented?
+        2. **Current Behavior**: What is happening now? (Include error messages, unexpected outputs, etc.)
+        3. **Expected Behavior**: What should happen instead?
+        4. **Reproduction Steps** (if applicable): Clear steps to reproduce the issue
+        5. **Success Criteria**: How will we know the problem is solved?
+            - What tests should pass?
+            - What behavior should change?
+            - What outputs should be different?
+        6. **Key Requirements**:
+            - Must-have functionality
+            - Constraints to respect (backwards compatibility, performance, etc.)
+            - Files/functions likely involved
+        7. **Important Notes**:
+            - Edge cases to consider
+            - Potential pitfalls
+            - Related functionality that might be affected
+        If any section is not applicable or cannot be determined from the problem statement, write "Not specified" for that section.
+        Format your response as markdown with clear section headers.
+        Be concise but complete. Extract information that's present, don't invent details.
+        """
+    )
+    retry = 0
+    selected_model = QWEN_MODEL_NAME
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": ENHANCEMENT_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Problem Statement:\n\n{problem_statement}",
+                },
+            ]
+            enhanced, _ = EnhancedNetwork.make_request(
+                messages, model=selected_model, attempt=1, temperature=0.0
+            )
+            return enhanced
+        except Exception as e:
+            retry += 1
+            other_models = [model for model in AGENT_MODELS if model != selected_model]
+            selected_model = other_models[random.randint(0, len(other_models) - 1)]
+            time.sleep(2)
+    return ""
+
+def get_misunderstanding_point(problem_statement: str, code_skeleton: str) -> str:
+    MISUNDERSTANDING_ANALYSIS_PROMPT = textwrap.dedent(
+        """
+        You are an expert code reviewer and problem analyst. Your task is to identify potential misunderstanding points
+        that could lead to implementation failures when solving the given problem.
+        
+        Analyze the problem statement and code skeleton to identify:
+        
+        1. **Ambiguous Requirements**:
+           - Unclear specifications that could be interpreted multiple ways
+           - Missing details that might lead to incorrect assumptions
+           - Vague constraints or edge cases not explicitly mentioned
+        
+        2. **Common Misinterpretations**:
+           - Typical mistakes developers make when reading similar problems
+           - Easy-to-miss requirements or constraints
+           - Subtle details that are often overlooked
+        
+        3. **Code Skeleton Analysis**:
+           - Potential misunderstandings from the provided code structure
+           - Function signatures that might be misinterpreted
+           - Expected behavior implied by the skeleton that might conflict with requirements
+           - Missing or incomplete hints in the skeleton
+        
+        4. **Implementation Pitfalls**:
+           - Logic errors that are likely to occur
+           - Edge cases that are easy to miss
+           - Data structure or algorithm choices that might be incorrect
+           - Boundary conditions that could be misunderstood
+        
+        5. **Critical Points to Clarify**:
+           - Specific questions that should be answered before implementation
+           - Assumptions that must be verified
+           - Requirements that need explicit confirmation
+        
+        Format your response as markdown with clear section headers.
+        Be specific and actionable. Focus on misunderstandings that would lead to test failures or incorrect implementations.
+        """
+    )
+    
+    retry = 0
+    selected_model = random.choice([GLM_MODEL_NAME, KIMI_MODEL_NAME])
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": MISUNDERSTANDING_ANALYSIS_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Problem Statement:\n{problem_statement}\n\nCode Skeleton:\n{code_skeleton}\n\nIdentify the potential misunderstanding points that could lead to implementation failures."
+                }
+            ]
+            misunderstanding_analysis, _ = EnhancedNetwork.make_request(messages, model=selected_model, attempt=1, temperature=0.0)
+            return misunderstanding_analysis
+        except Exception as e:
+            logger.error(f"Error in get_misunderstanding_point: {e}")
+            retry += 1
+            if retry < 10:
+                other_models = [model for model in [GLM_MODEL_NAME, QWEN_MODEL_NAME] if model != selected_model]
+                selected_model = other_models[random.randint(0, len(other_models) - 1)]
+            time.sleep(random.uniform(2, 4))
+    return ""
+
+def generate_solution_files(problem_statement: str, code_skeleton: str, temperature: float = 0.7) -> List[tuple[str, str]]:
+    system_prompt = textwrap.dedent(
+        """
+        You are an expert software engineer. Your task is to generate a complete, working solution for the given problem statement.
+        Strict Requirements:
+        1. You **MUST** output the solution as a JSON array where each element contains file_path and content.
+        2. Do not include markdown formatting in the main code.
+        3. Use only standard libraries and frameworks (no external libraries).
+        4. Implement all required classes and functions exactly with the same names as in the initial code stub.
+        5. You may add helper functions or classes if needed, but do not remove or rename the original ones.
+        6. Ensure the solution handles all edge cases, validates inputs, and produces correct outputs.
+        7. The solution must be executable as-is with no placeholders or TODOs.
+        8. **IMPORTANT**: Add clear comments above each edge case handling section to identify which specific edge case is being addressed. Use the format: `# Edge Case: [description of the edge case]`
+        9. **IMPORTANT**: Add a comment at the end of each function/class that lists all edge cases handled, using the format: `# Handled Edge Cases: [list of edge cases]`
+        10. **IMPORTANT**: Generate a docstring for every class or function. Each docstring should describe what the class/function does, its parameters (if applicable), return values (if applicable), and any important behavior or edge cases.
+        
+        OUTPUT FORMAT:
+        You must return a JSON array with the following structure:
+        [
+            {
+                "file_path": "path/to/file.py",
+                "content": "file content here"
+            },
+            {
+                "file_path": "path/to/another.js",
+                "content": "another file content here"
+            }
+        ]
+        
+        Return ONLY the JSON array, no additional text or explanations.
+        """
+    )
+    retry = 0
+    code_generation_messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": f"Problem Statement:\n{problem_statement}\n\nInitial files:\n{code_skeleton}\nGenerate the complete and correct implementation in files.\n\nReturn a JSON array with file_path and content for each file.",
+        },
+    ]
+    selected_model = QWEN_MODEL_NAME
+    print(format_log("GENERATE_SOLUTION_FILES", "Requesting code generation from model"))
+    while retry < 10:
+        try:
+            result = EnhancedNetwork.make_request(
+                code_generation_messages,
+                model=selected_model,
+                attempt=1,
+                temperature=temperature
+            )
+            if isinstance(result, tuple):
+                code_response, _ = result
+            else:
+                code_response = result
+            code_response = extract_json_array_from_text(code_response)
+            try:
+                files_data = json.loads(code_response)
+                if not isinstance(files_data, list):
+                    raise ValueError("Response is not a list")
+                files_list = []
+                for file_data in files_data:
+                    if not isinstance(file_data, dict):
+                        continue
+                    file_path = file_data.get("file_path", "")
+                    content = file_data.get("content", "")
+                    if file_path and content is not None:
+                        files_list.append((file_path, content))
+                if files_list:
+                    return files_list
+                else:
+                    retry += 1
+                    continue
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Error parsing JSON response: {e}")
+                retry += 1
+                continue
+                
+        except Exception as e:
+            if '429' in str(e):
+                time.sleep(random.uniform(10, 30))
+            logger.error(f"Error in generate_solution_files: {e}")
+            retry += 1
+            time.sleep(random.uniform(1, 3))
+    return []
+
+def check_problem_type(problem_statement):
+    type_count = {PROBLEM_TYPE_CREATE: 0, PROBLEM_TYPE_FIX: 0}
+    enhancement = enhance_problem_statement(problem_statement)
+    for _ in range(1):
+        problem_type = get_problem_type(problem_statement, enhancement)
+        type_count[problem_type] += 1
+    if type_count[PROBLEM_TYPE_CREATE] > type_count[PROBLEM_TYPE_FIX]:
+        return PROBLEM_TYPE_CREATE, enhancement
+    elif type_count[PROBLEM_TYPE_FIX] > type_count[PROBLEM_TYPE_CREATE]:
+        return PROBLEM_TYPE_FIX, enhancement
+    return PROBLEM_TYPE_FIX, enhancement
+
+def generate_test_files(problem_statement: str, files_to_test: str, code_skeleton: str, temperature: float = 0.0) -> List[tuple[str, str, list[str]]]:
+    system_prompt = textwrap.dedent(
+        """
+        You are an expert testcase developer. 
+        Important points:-
+        - Follow the best practices and conventions of the language of the code skeleton.
+        - You have generation limit of 2048 tokens. Hence you must stop generating more test cases when you are near the limit.
+        - If you get syntax error, check if last assistant response was truncated. If yes, then skip last couple of test cases to fit in.
+        - Use the only built-in testing framework for the language of the code skeleton. **MUST** use the built-in testing framework.
+            - For python, use `unittest` to write a test.
+            - For javascript, **MUST** use **`node:test` and `node:assert`** to write a test.
+            - For other languages, use built-in test frameworks as well.
+        - **CRITICAL: Add useful comments to test cases**:
+            - Add a comment above each test case explaining what it tests (e.g., "Test case: verify the function correctly handles [test case content]")
+            - Add comments for edge cases explaining why they are important (e.g., "Edge case: tests [edge case content]")
+            - Add comments for complex test logic explaining the test strategy (e.g., "This test verifies the function correctly handles multiple edge cases in sequence")
+            - Use clear, descriptive comments that explain the purpose and expected behavior of each test
+            - Comments should help developers understand what scenario is being tested and why it matters
+        - **IMPORTANT**: Generate a docstring for every test case. Each docstring should describe what the test case does, its parameters (if applicable), return values (if applicable), and any important behavior or edge cases.
+        
+        OUTPUT FORMAT:
+        You must return a JSON array with the following structure:
+        [
+            {
+                "file_path": "test_file.py",
+                "content": "test file content here",
+                "run_command": "content of run_command here"
+            },
+            {
+                "file_path": "test_another.js",
+                "content": "another test file content here",
+                "run_command": "content of run_command here"
+            }
+        ]
+        For run_command:
+        - It must be an array of strings representing the command to run the test file
+        - Use the simplest command possible to run the test file
+
+        Return ONLY the JSON array, no additional text or explanations.
+        """
+    )
+
+    retry = 0
+    test_generation_messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": f"Problem Statement:\n{problem_statement}\n\nFiles To Test: {files_to_test}\n\nCode skeleton: \n{code_skeleton}\n\nGenerate the complete and correct testcases.\n\nReturn a JSON array with file_path, content, and run_command for each test file. The run_command should be an array of strings representing the command to run that test file.",
+        }
+    ]
+
+    selected_model = QWEN_MODEL_NAME
+    print(format_log("GENERATE_TEST_FILES", "Requesting test generation from model"))
+    
+    while retry < 10:
+        try:
+            result = EnhancedNetwork.make_request(
+                test_generation_messages,
+                model=selected_model,
+                attempt=1,
+                temperature=temperature
+            )
+            if isinstance(result, tuple):
+                testcode_response, _ = result
+            else:
+                testcode_response = result
+            testcode_response = extract_json_array_from_text(testcode_response)
+            try:
+                files_data = json.loads(testcode_response)
+                if not isinstance(files_data, list):
+                    raise ValueError("Response is not a list")
+                files_list = []
+                for file_data in files_data:
+                    if not isinstance(file_data, dict):
+                        continue
+                    file_path = file_data.get("file_path", "")
+                    content = file_data.get("content", "")
+                    run_command = file_data.get("run_command", [])
+                    if not isinstance(run_command, list):
+                        run_command = []
+                    else:
+                        run_command = [str(cmd) for cmd in run_command if isinstance(cmd, (str, int, float))]
+                    if file_path and content is not None:
+                        files_list.append((file_path, content, run_command))
+                if files_list:
+                    return files_list
+                else:
+                    retry += 1
+                    continue
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Error parsing JSON response: {e}")
+                retry += 1
+                continue
+        except Exception as e:
+            if '429' in str(e):
+                time.sleep(random.uniform(10, 30))
+            logger.error(f"Error in generate_test_files: {e}")
+            retry += 1
+            time.sleep(random.uniform(1, 3))
+    return []
+
+def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
+    global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
+    DEFAULT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    run_id = os.getenv("EVALUATION_RUN_ID", "")
+    repo_path = os.getenv("REPO_PATH")
+    if repo_path:
+        repo_dir = os.path.abspath(repo_path)
+    else:
+        repo_dir = os.path.abspath(repo_dir)
+    sys.path.insert(0, repo_dir)
+    if os.path.exists(repo_dir):
+        os.chdir(repo_dir)
+    set_env_for_agent()
+    timeout = DEFAULT_TIMEOUT - TIME_MARGIN_FOR_PATCH
+    result = None
+    exception_occurred = None
+    task_completed = threading.Event()
+    problem_type = None
+
+    def run_task():
+        nonlocal result, exception_occurred, problem_type
+        try:
+            problem_type, enhancement = check_problem_type(
+                input_dict.get("problem_statement")
+            )
+            if problem_type == PROBLEM_TYPE_FIX:
+                process_fix_task(input_dict, enhancement)
+            else:
+                process_create_task(input_dict, enhancement)
+        except Exception as e:
+            exception_occurred = e
+            logger.error(f"Error in agent_main: {e}")
+            try:
+                time.sleep(1)
+                process_fix_task(input_dict, enhancement)
+            except Exception as e2:
+                exception_occurred = e2
+        finally:
+            task_completed.set()
+    task_thread = threading.Thread(target=run_task, daemon=True)
+    task_thread.start()
+    task_thread.join(timeout=timeout)
+    timed_out = task_thread.is_alive()
+    if timed_out:
+        logger.warning(f"Task execution timed out after {timeout} seconds, killing thread")
+    print(format_log("AGENT_MAIN", f"{problem_type} task finished successfully"))
+    
+    result = generate_patch_from_modified_files()
+    print(format_log("AGENT_MAIN", "final patch generated"))
+    print(format_log("AGENT_MAIN", f"result: {result}"))
+    return result if result else ""
+
+def is_all_tests_passed(output: str) -> bool:
+    check_all_tests_passed_prompt = """
+    Check the test output and tell me if all the tests passed successfully or there is any failure or error.
+    This is the output:
+    ```
+    {output}
+    ```
+    Return only "true" or "false".
+    """
+    retry = 1
+    while retry < 10:
+        try:
+            result, _ = EnhancedNetwork.make_request(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": check_all_tests_passed_prompt.format(output=output),
+                    }
+                ],
+                model=QWEN_MODEL_NAME,
+            )
+
+            if result.lower() == "true":
+                return True
+            else:
+                return False
+        except Exception as e:
+            retry += 1
+            time.sleep(1)
+    return False
+
+def extract_json_array_from_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\n?", "", text, count=1)
+    text = text.removesuffix("```").strip()
+    start_indices = []
+    for i, char in enumerate(text):
+        if char == '[':
+            start_indices.append(i)
+    if not start_indices:
+        return text
+    valid_arrays = []
+    for start_idx in start_indices:
+        bracket_count = 1
+        in_string = False
+        escape_next = False
+        for i in range(start_idx + 1, len(text)):
+            char = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if not in_string:
+                if char == '[':
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        candidate = text[start_idx:i+1]
+                        try:
+                            json.loads(candidate)
+                            valid_arrays.append(candidate)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        break
+    if not valid_arrays:
+        return text[start_indices[0]:]
+    for idx, arr in enumerate(valid_arrays):
+        print(format_log("EXTRACT_JSON_ARRAY", f"valid_array[{idx}]: {arr}"))
+    return max(valid_arrays, key=len)
+
+def find_files_to_modify_workflow(cot: COT, tool_manager: EnhancedToolManager, system_prompt: str, instance_prompt: str, timeout: int, finish_tool_name="finish_find_files_to_fix") -> str:
+    global run_id, START_TIME
+    logger.info(f"[find_files_to_modify] Starting file finding workflow... ")
+    result = recursive_workflow(
+        cot=cot,
+        tool_manager=tool_manager,
+        system_prompt=system_prompt,
+        instance_prompt=instance_prompt,
+        finish_tool_name=finish_tool_name,
+        timeout=timeout,
+        log_prefix="find_files_to_modify",
+        handle_repeated_thoughts=False,
+        initial_observation=None,
+        return_observation=True,
+        models=[GLM_MODEL_NAME],
+        max_retries=3,
+    )
+    is_found, obs = result
+    if is_found:
+        logger.info(f"[find_files_to_modify] Finish tool observation: {obs}")
+        return obs
+    else:
+        return ""
+
+def run_test_files(test_files: List[tuple[str, str, list[str]]], timeout: int = 30) -> List[tuple[bool, str]]:
+    results = []
+    for file_path, _, run_command in test_files:
+        if not run_command or not isinstance(run_command, list) or len(run_command) == 0:
+            error_msg = f"Invalid run_command for {file_path}: {run_command}. Expected non-empty list of strings."
+            logger.error(error_msg)
+            results.append((False, error_msg))
+            continue
+        try:
+            run_command = [str(cmd) for cmd in run_command]
+        except Exception as e:
+            error_msg = f"Error converting run_command to strings for {file_path}: {e}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+            continue
+        try:
+            logger.info(f"Running test file {file_path} with command: {run_command}")
+            result = subprocess.run(
+                run_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                cwd=os.getcwd()
+            )
+            combined_output = ""
+            if result.stdout:
+                combined_output += f"STDOUT:\n{result.stdout}\n"
+            if result.stderr:
+                combined_output += f"STDERR:\n{result.stderr}\n"
+            if not combined_output:
+                combined_output = f"No output from test execution (returncode: {result.returncode})"
+
+            passed = is_all_tests_passed(combined_output)
+            if not passed:
+                combined_output = f"Test execution failed with return code {result.returncode}\n\n{combined_output}"
+            results.append((passed, combined_output))
+        except subprocess.TimeoutExpired as e:
+            error_msg = f"Test execution timed out after {timeout} seconds for {file_path}\nCommand: {' '.join(run_command)}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+        except FileNotFoundError as e:
+            error_msg = f"Command not found for {file_path}: {run_command[0]}\nFull command: {' '.join(run_command)}\nError: {e}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+        except PermissionError as e:
+            error_msg = f"Permission denied when running test for {file_path}\nCommand: {' '.join(run_command)}\nError: {e}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+        except ValueError as e:
+            error_msg = f"Invalid command arguments for {file_path}: {run_command}\nError: {e}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+        except Exception as e:
+            error_msg = f"Unexpected error running test for {file_path}\nCommand: {' '.join(run_command)}\nError: {type(e).__name__}: {e}\nTraceback: {traceback.format_exc()}"
+            logger.error(error_msg)
+            results.append((False, error_msg))
+    return results
+
+def find_files_to_modify(problem_statement: str) -> str:
+    global run_id
+    tool_manager = FixTaskEnhancedToolManager(
+        available_tools = [
+            "get_file_content",
+            "list_directory_structure",
+            "finish_find_files_to_fix"
+        ]
+    )
+    FIND_FILES_TO_MODIFY = textwrap.dedent(
+        """
+        You are a helpful assistant that finds the files to modify related to the problem statement.
+        You must check the directory structure using `list_directory_structure` tool and then determine which files are needed for the problem statement.            
+        **IMPORTANT**: After finding all files to modify, you MUST call the `finish_find_files_to_fix` tool to signal the completion of the file finding workflow execution.
+        Do NOT call `finish_find_files_to_fix` until you have identified all the files that need to be modified.
+
+        You have access to the following tools:-
+        {tools_docs}
+
+        {format_prompt}
+        """
+    ).format(tools_docs=tool_manager.get_tool_docs(), format_prompt=FORMAT_PROMPT_FIND_FILES_TO_FIX)
+    while True:
+        try:
+            cot=COT(latest_observations_to_keep=10, summarize_batch_size=10)
+            instance_prompt = f"Problem Statement:\n{problem_statement}"
+            result = find_files_to_modify_workflow(
+                cot,
+                tool_manager,
+                FIND_FILES_TO_MODIFY,
+                instance_prompt,
+                500,
+                finish_tool_name="finish_find_files_to_fix",
+            )
+            logger.info(f"[find_files_to_modify] Result: {result}")
+            if not result:
+                print(format_log("find_files_to_modify", "No result returned, retrying..."))
+                time.sleep(2)
+                continue
+            if not isinstance(result, list):
+                result = [result]
+            contents = []
+            valid_all_files_found = False
+            for file_path in result:
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        contents.append(f"{file_path}\n{{\n{f.read()}\n}}")
+                        valid_all_files_found = True
+                except Exception as e:
+                    valid_all_files_found = False
+                    logger.error(f"Failed to open file {file_path}: {e}")
+            if valid_all_files_found and contents:
+                return "\n\n".join(contents)
+            else:
+                print(format_log("find_files_to_modify", "No valid files found, retrying..."))
+                time.sleep(2)
+                continue
+        except Exception as e:
+            logger.error(f"Error in get files to modify: {e}")
+            print(format_log("find_files_to_modify", "Exception occurred, retrying..."))
+            time.sleep(2)
+            continue
+
+def make_transition(messages: List[Dict[str, Any]], models: List[Model], temperature: float, tried_thoughts: List[str]) -> tuple[str | None, Any, Any]:
+    transition_start_time = time.time()
+    inference_msg = make_inference_message_function(messages)    
+    selected_model = random.choice(models)
+    retry = 0
+    max_retries = 10
+    while retry < max_retries:
+        retry += 1 
+        try:
+            raw_text, _ = EnhancedNetwork.make_request(
+                inference_msg,
+                model=selected_model,
+                attempt=1,
+                temperature=temperature
+            )
+            is_valid, error_msg = EnhancedNetwork.is_valid_response(raw_text)
+            if not is_valid:
+                raise Exception(error_msg)
+            next_thought, next_tool_name, next_tool_args, error_msg = EnhancedNetwork.parse_response(raw_text)
+            if error_msg:
+                raise Exception(error_msg)
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str:
+                sleep_time = random.uniform(15, 55)
+                print(format_log("MAKE_TRANSITION", f"HTTP 429 error detected, sleeping for {sleep_time} seconds"))
+                time.sleep(sleep_time)
+            elif "504" in error_str:
+                print(format_log("MAKE_TRANSITION", f"HTTP 504 error detected, switching model: {e}"))
+                other_models = [m for m in models if m != selected_model]
+                if other_models:
+                    selected_model = random.choice(other_models)
+                    print(format_log("MAKE_TRANSITION", f"Switched to model: {selected_model}"))
+                time.sleep(2)
+            else:
+                print(format_log("MAKE_TRANSITION", f"Inference failed on retry {retry + 1}, switching model: {e}"))
+                other_models = [m for m in models if m != selected_model]
+                if other_models:
+                    selected_model = random.choice(other_models)
+                    print(format_log("MAKE_TRANSITION", f"Switched to model: {selected_model}"))
+                time.sleep(2)   
+            continue
+        if next_thought is None:
+            time.sleep(2)
+            continue
+        if next_thought in tried_thoughts:
+            time.sleep(2)
+            temperature = 0.7
+            continue
+        transition_elapsed = time.time() - transition_start_time
+        print(format_log("MAKE_TRANSITION", f"Successfully completed inference using model: {selected_model} (elapsed: {transition_elapsed:.2f}s)"))
+        return next_thought, next_tool_name, next_tool_args
+    return None, None, None
+
+def recursive_workflow(
+    cot: COT,
+    tool_manager: EnhancedToolManager,
+    system_prompt: str,
+    instance_prompt: str | Callable[[int], str],
+    finish_tool_name: str = "finish",
+    timeout: int | None = None,
+    log_prefix: str = "WORKFLOW",
+    handle_repeated_thoughts: bool = True,
+    initial_observation: Callable[[], tuple[str, Any, Any]] | None = None,
+    return_observation: bool = False,
+    models: List[Model] | None = None,
+    max_retries: int = 3,
+) -> bool | tuple[bool, str]:
+    global START_TIME
+    if models is None:
+        models = [QWEN_MODEL_NAME, GLM_MODEL_NAME]
+    
+    def workflow(step: int):
+        if timeout is not None and time.time() - START_TIME > timeout:
+            if return_observation:
+                return False, ""
+            return False
+        current_instance_prompt = instance_prompt(step) if isinstance(instance_prompt, Callable) else instance_prompt
+        print(format_log(log_prefix, f"Starting workflow step {step}"))
+        
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": current_instance_prompt},
+        ]
+        messages.extend(cot.to_str())
+        messages.append({"role": "system", "content": STOP_INSTRUCTION})
+        temperature = 0.0
+        tried_thoughts = []
+        if handle_repeated_thoughts:
+            repeated_thoughts_count = cot.count_repeated_thoughts()
+            if repeated_thoughts_count == 2:
+                if cot.thoughts:
+                    cot.thoughts.pop()
+                if return_observation:
+                    return False, ""
+                return False
+            if repeated_thoughts_count == 1:
+                if cot.thoughts:
+                    last_thought = cot.thoughts[-1]
+                    messages.append(
+                        {"role": "user", "content": MAKE_REAL_PROGRESS.format(
+                            previous_response=f"next_thought:{last_thought.next_thought}\n next_tool_name:{last_thought.next_tool_name}\n next_tool_args:{last_thought.next_tool_args}"
+                        )}
+                    )
+                    temperature = 0.7
+        retry = 0
+        while retry < max_retries:
+            retry += 1
+            try:
+                if step == 0 and initial_observation is not None:
+                    next_thought, next_tool_name, next_tool_args = initial_observation()
+                else:
+                    next_thought, next_tool_name, next_tool_args = make_transition(
+                        messages, models, temperature, tried_thoughts
+                    )
+            except Exception as e:
+                print(format_log(log_prefix, f"Exception in make_transition: {e}"))
+                continue
+            if next_thought is None:
+                print(format_log(log_prefix, f"make_transition returned None on retry {retry}"))
+                if return_observation:
+                    time.sleep(2)
+                    temperature = 0.7
+                continue
+            tried_thoughts.append(next_thought)
+            tool_names_list = next_tool_name if isinstance(next_tool_name, list) else [next_tool_name]
+            tool_args_list = next_tool_args if isinstance(next_tool_args, list) else [next_tool_args]
+            combined_observation, error_observation_count, success_observation_count = make_observation(
+                tool_names_list, tool_args_list, tool_manager
+            )
+            cot.add_action(
+                COT.Action(
+                    next_thought=next_thought,
+                    next_tool_name=next_tool_name,
+                    next_tool_args=next_tool_args,
+                    observation=combined_observation,
+                    is_error=not error_observation_count == 0,
+                    raw_response=None,
+                    total_attempts=0,
+                    inference_error_counter={},
+                    request_data=messages
+                )
+            )
+            finish_called = any(name == finish_tool_name for name in tool_names_list)
+            if finish_called:
+                if return_observation:
+                    finish_observation = combined_observation
+                    if len(tool_names_list) > 1:
+                        finish_idx = tool_names_list.index(finish_tool_name)
+                        tool_marker = f"Tool {finish_idx + 1} ({finish_tool_name}):"
+                        if tool_marker in combined_observation:
+                            parts = combined_observation.split(tool_marker, 1)
+                            if len(parts) > 1:
+                                obs_part = parts[1]
+                                if "\n\n--- Tool Call Results ---" in obs_part:
+                                    obs_part = obs_part.split("\n\n--- Tool Call Results ---")[0]
+                                next_tool_pattern = r"\n\nTool \d+ \("
+                                if re.search(next_tool_pattern, obs_part):
+                                    obs_part = re.split(next_tool_pattern, obs_part)[0]
+                                finish_observation = obs_part.strip()
+                    return True, finish_observation
+                return True
+            if return_observation:
+                is_finished, obs = workflow(step + 1)
+                if is_finished:
+                    return True, obs
+            else:
+                is_finished = workflow(step + 1)
+                if is_finished:
+                    return True
+        if return_observation:
+            return False, ""
+        return False
+    result = workflow(0)
+    return result
+
+
+def make_observation(tool_names_list: List[str], tool_args_list: List[Any], tool_manager: Any) -> tuple[str, int, int]:
+    global MODIEFIED_FILE_PATHS
+    all_observations = []
+    success_observation_count = 0
+    error_observation_count = 0
+    for idx, (tool_name, tool_args) in enumerate(zip(tool_names_list, tool_args_list)):
+        try:
+            if '"' in tool_name or "'" in tool_name:
+                tool_name = tool_name.replace('"', '').replace("'", "")
+            print(format_log("MAKE_OBSERVATION", f"Executing tool: {tool_name}"))
+            observation = _safe_call_tool(tool_manager, tool_name, tool_args)
+            if tool_name == "apply_code_edit" and tool_args and "file_path" in tool_args:
+                file_path = tool_args["file_path"]
+                if "ok, code edit applied successfully" in str(observation).lower():
+                    if file_path not in MODIEFIED_FILE_PATHS:
+                        MODIEFIED_FILE_PATHS.append(file_path)
+            observation_str = str(observation)
+            if len(observation_str) > 200000:
+                observation = f"ERROR: The observation result is too long ({len(observation_str)} characters). Please use another tool to get the information you need."
+            all_observations.append(observation)
+            success_observation_count += 1
+        except EnhancedToolManager.Error as e:
+            error_msg = f"Tool {idx + 1} ({tool_name}) error: {e.message}"
+            all_observations.append(error_msg)
+            error_observation_count += 1
+        except Exception as e:
+            import traceback
+            error_traceback = traceback.format_exc()
+            error_msg = f"Tool {idx + 1} ({tool_name}) exception: {str(e)}\n{error_traceback}"
+            all_observations.append(error_msg)
+            error_observation_count += 1
+    if len(all_observations) == 1:
+        combined_observation = all_observations[0]
+    else:
+        combined_observation = "\n\n--- Tool Call Results ---\n" + "\n\n".join(
+            [
+                f"Tool {i + 1} ({tool_names_list[i]}):\n{obs}"
+                for i, obs in enumerate(all_observations)
+            ]
+        )
+    return combined_observation, error_observation_count, success_observation_count
+
+def create_task_solve_workflow(problem_statement: str, difficulty: int = 0, clarity: int = 0) -> bool:
+    cot = COT(
+        latest_observations_to_keep=20,
+        summarize_batch_size=SUMMARIZE_BATCH_SIZE
+    )
+    tool_manager = FixTaskEnhancedToolManager(
+        available_tools=[
+            "list_directory_structure",
+            "search_in_files",
+            "get_file_content",
+            "modify_test_case",
+            "apply_code_edit",
+            "run_shell_cmd",
+            "run_code",
+            "finish"
+        ]
+    )
+    system_prompt = CREATE_TASK_SYSTEM_PROMPT.format(
+        tools_docs=tool_manager.get_tool_docs(),
+        problem_statement=problem_statement,
+        format_prompt=FORMAT_PROMPT
+    )
+    instance_prompt = INSTANCE_PROMPT_TEMPLATE.format(problem_statement=problem_statement)
+    return recursive_workflow(
+        cot=cot,
+        tool_manager=tool_manager,
+        system_prompt=system_prompt,
+        instance_prompt=instance_prompt,
+        finish_tool_name="finish",
+        timeout=None,
+        log_prefix="CREATE_TASK_SOLVE_WORKFLOW",
+        handle_repeated_thoughts=True,
+        initial_observation=None,
+        return_observation=False,
+        models=[QWEN_MODEL_NAME, GLM_MODEL_NAME],
+        max_retries=3,
+    )
+
+def write_files(files_list: List[tuple[str, str | None]]):
+    for file_path, content in files_list:
+        if content is not None:
+            try:
+                dir_path = os.path.dirname(file_path)
+                if dir_path:
+                    os.makedirs(dir_path, exist_ok=True)
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            except Exception as e:
+                logger.error(f"Error writing file {file_path}: {e}")
+
+def _safe_call_tool(tool_manager: EnhancedToolManager, tool_name: str, tool_args):
+    tool_fn = tool_manager.get_tool(tool_name)
+    if isinstance(tool_fn, str):
+        return tool_fn
+    if tool_args is None or tool_args == {}:
+        return tool_fn()
+    if not isinstance(tool_args, dict):
+        return tool_fn()
+    try:
+        sig = inspect.signature(tool_fn)
+        allowed = set(sig.parameters.keys())
+        allowed.discard("self")
+    except Exception:
+        allowed = set(tool_args.keys())
+    cleaned = {k: v for k, v in tool_args.items() if k in allowed}
+    try:
+        for k in list(cleaned.keys()):
+            v = cleaned[k]
+            p = sig.parameters.get(k)
+            ann = str(getattr(p, "annotation", ""))
+            if v is not None and isinstance(v, str) and ("List" in ann or "list" in ann):
+                cleaned[k] = v.split() if v.strip() else []
+    except Exception:
+        pass
+    return tool_fn(**cleaned) if cleaned else tool_fn()
+
+def format_log(function_name: str, content: str) -> str:
+    elapsed_time = time.time() - START_TIME
+    indented_content = "\n                    ".join(content.split("\n"))
+    return f"{elapsed_time:.3f}s: [{function_name}]\n\n                    {indented_content}\n"
+
+def initialize_repo():
+    try:
+        os.system("git reset --hard")
+        os.system("git clean -fd")
+    except Exception as e:
+        logger.error(f"Error running git commands: {e}")
+
+def get_files_content(created_files: List[str]) -> List[tuple[str, str | None]]:
+    created_files_contents = []
+    for file_path in created_files:
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    created_files_contents.append((file_path, f.read()))
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {e}")
+            created_files_contents.append((file_path, None))
+    return created_files_contents
+
+def generate_patch_from_modified_files() -> str:
+    try:
+        exclude = {"src/agent.py", "src/agent_runner.py"}
+        # Get only modified files (not newly created/untracked files)
+        ls = subprocess.run(
+            ["git", "ls-files", "-m", "--exclude-standard"], capture_output=True, text=True, timeout=30, check=True
+        ).stdout.splitlines()
+
+        to_add = [f for f in ls if f not in exclude]
+        if to_add:
+            subprocess.run(["git", "add", "--"] + to_add, check=True, timeout=30)
+
+        diff = subprocess.run(["git", "diff", "--cached", "--no-color", "--unified=3"], capture_output=True, text=True, timeout=30, check=True)
+
+        if diff.stderr:
+            logger.warning("git diff (stderr): %s", diff.stderr.strip())
+
+        patch_text = diff.stdout or ""
+        return patch_text
+    except Exception as e:
+        return f"Error generating git patch: {e}"
+
+def process_create_task(input_dict: Dict[str, Any], enhancement: str):
+    global SOLUTION_FILES, MODIEFIED_FILE_PATHS
+    problem_statement = input_dict.get("problem_statement", "")
+    code_skeleton = find_files_to_modify(problem_statement)
+    timeout_of_basic_approach = 500
+    for step in range(20):
+        print(format_log("PROCESS_CREATE_TASK", f"Starting step {step + 1}/20"))
+        solution_files = generate_solution_files(problem_statement, code_skeleton, temperature=0.0)
+        if not solution_files:
+            print(format_log("PROCESS_CREATE_TASK", f"Step {step + 1}: Failed to generate solution files"))
+            if time.time() - START_TIME > timeout_of_basic_approach:
+                break
+            continue
+        solution_file_paths = [file_path for file_path, _ in solution_files]
+        files_to_test = str(solution_file_paths)
+        test_files = generate_test_files(problem_statement, files_to_test, code_skeleton, temperature=0.0)
+        if not test_files:
+            print(format_log("PROCESS_CREATE_TASK", f"Step {step + 1}: Failed to generate test files"))
+            if time.time() - START_TIME > timeout_of_basic_approach:
+                break
+            continue
+        initialize_repo()
+        write_files(solution_files)
+        write_files([(file_path, content) for file_path, content, _ in test_files])
+        test_results = run_test_files(test_files, timeout=30)
+        all_passed = all(passed for passed, _ in test_results)
+        print(format_log("PROCESS_CREATE_TASK", f"Step {step + 1}: Test results - All passed: {all_passed}"))
+        for idx, (passed, message) in enumerate(test_results):
+            test_file_path = test_files[idx][0] if idx < len(test_files) else "unknown"
+            status = "PASSED" if passed else "FAILED"
+            print(format_log("PROCESS_CREATE_TASK", f"Step {step + 1}: Test {test_file_path} - {status}"))
+        if all_passed:
+            SOLUTION_FILES = solution_files
+            MODIEFIED_FILE_PATHS = [file_path for file_path, _ in solution_files]
+            print(format_log("PROCESS_CREATE_TASK", f"Step {step + 1}: All tests passed! Solution found."))
+            break
+        if time.time() - START_TIME > timeout_of_basic_approach:
+            break
+    if len(SOLUTION_FILES) > 0:
+        return
+    initialize_repo()
+    solution_files = generate_solution_files(problem_statement, code_skeleton, temperature=0.0)
+    solution_file_paths = [file_path for file_path, _ in solution_files]
+    files_to_test = str(solution_file_paths)
+    test_files = generate_test_files(problem_statement, files_to_test, code_skeleton, temperature=0.0)
+    MODIEFIED_FILE_PATHS = solution_file_paths
+    print(format_log("PROCESS_CREATE_TASK", f"MODIEFIED_FILE_PATHS: {MODIEFIED_FILE_PATHS}"))
+    write_files(solution_files)
+    write_files([(file_path, content) for file_path, content, _ in test_files])
+    misunderstanding_point = get_misunderstanding_point(problem_statement, code_skeleton)
+    concepts = extract_core_concepts_for_search(problem_statement)
+    edge_case_guidance = ""
+    if concepts.get("common_edge_cases"):
+        edge_case_guidance = f"\n\n**Common Edge Cases to Consider (based on similar problems):**\n"
+        for i, case in enumerate(concepts.get("common_edge_cases", []), 1):
+            edge_case_guidance += f"{i}. {case}\n"
+    problem_statement = problem_statement + "\n\n--- Misunderstanding Points Analysis ---\n" + misunderstanding_point + edge_case_guidance
+    enhanced_problem = problem_statement
+    if enhancement:
+        enhanced_problem = problem_statement + "\n\n---\n\n# Enhanced Problem Analysis\n\n" + enhancement
+    workflow_completed = threading.Event()
+    workflow_timeout = DEFAULT_TIMEOUT - TIME_MARGIN_FOR_PATCH - TIME_PADDING_FOR_WORKFLOW - (time.time() - START_TIME)
+    if workflow_timeout <= 0:
+        print(format_log("PROCESS_CREATE_TASK", "Workflow timeout is non-positive, skipping workflow"))
+        return
+    print(format_log("PROCESS_CREATE_TASK", f"Workflow timeout: {workflow_timeout}"))
+    is_success_workflow = False
+    def run_workflow():
+        nonlocal is_success_workflow
+        try:
+            while is_success_workflow == False:
+                is_success_workflow = create_task_solve_workflow(enhanced_problem)
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"Error in create_task_solve_workflow: {e}")
+        finally:
+            workflow_completed.set()
+    workflow_thread = threading.Thread(target=run_workflow, daemon=True)
+    workflow_thread.start()
+    workflow_thread.join(timeout=workflow_timeout)
+    timed_out = workflow_thread.is_alive()
+    if timed_out:
+        logger.warning(f"Workflow execution timed out after {workflow_timeout} seconds")
+    print(format_log("PROCESS_CREATE_TASK", "Create task work flow successfully finished"))
+    if is_success_workflow == True:
+        print(format_log("PROCESS_CREATE_TASK", "Create task work flow successfully finished with result: True"))
+        SOLUTION_FILES = get_files_content(MODIEFIED_FILE_PATHS)
+    else:
+        print(format_log("PROCESS_CREATE_TASK", "Create task work flow successfully finished with result: False"))
+    return
+
+def extract_core_concepts_for_search(problem_statement: str) -> dict:
+    EXTRACT_CONCEPTS_PROMPT = textwrap.dedent("""
+        You are an expert at analyzing programming problems and extracting their core concepts.
+        Your task is to identify the fundamental concepts and domain of the problem using the exact terminology from the problem statement.
+        
+        Rules:
+        1. Identify the core domain related to the problem statement.
+        2. Extract key algorithmic concepts related to the problem statement.
+        3. Identify common edge cases that similar problems typically have
+        4. Can use synonyms, related terms, or broader categories instead of exact words from the problem
+        5. Focus on what types of inputs/outputs and validation might be needed
+        
+        Return a JSON object with:
+        - "search_terms": array of 2-4 search terms
+        - "domain": the problem domain in general terms
+        - "common_edge_cases": array of typical edge cases for this type of problem
+        -  "problem_complexity": select either "simple" or "complex"
+    """)
+    retry = 0
+    selected_model = QWEN_MODEL_NAME
+    while retry < 10:
+        try:
+            messages = [
+                {"role": "system", "content": EXTRACT_CONCEPTS_PROMPT},
+                {"role": "user", "content": f"Problem Statement:\n{problem_statement}"},
+            ]
+            response, _ = EnhancedNetwork.make_request(
+                messages, model=selected_model, temperature=0.0
+            )
+            json_match = re.search(
+                r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", response, re.DOTALL
+            )
+            if json_match:
+                try:
+                    concepts = json.loads(json_match.group(0))
+                    if isinstance(concepts, dict) and "search_terms" in concepts:
+                        return concepts
+                except json.JSONDecodeError:
+                    code_block_match = re.search(
+                        r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL
+                    )
+                    if code_block_match:
+                        try:
+                            concepts = json.loads(code_block_match.group(1))
+                            if (
+                                isinstance(concepts, dict)
+                                and "search_terms" in concepts
+                            ):
+                                return concepts
+                        except json.JSONDecodeError:
+                            pass
+            return {"search_terms": [], "domain": "", "common_edge_cases": [], "problem_complexity": "simple"}
+        except Exception as e:
+            retry += 1
+            if retry > 2:
+                other_models = [model for model in AGENT_MODELS if model != selected_model]
+                selected_model = other_models[random.randint(0, len(other_models) - 1)]
+            time.sleep(1)
+    return {"search_terms": [], "domain": "", "common_edge_cases": [], "problem_complexity": "simple"}
